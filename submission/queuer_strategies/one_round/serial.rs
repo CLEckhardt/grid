@@ -1,14 +1,14 @@
-
+// NOTE: There is no queue trait, since it is an Iterator
 
 // TODO: Pull the BatchQueueStrategy trait out to mod
 // TODO: Update StoreAbstraction methods to match the actual store
 
 // Abstraction for a batch submission
-// TODO: Change this to the real stuct
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BatchSubmission {
+    id: String,
     service_id: String,
-    abstraction: String,
+    serialized_batch: Vec<u8>,
 }
 
 // This is the per-batch struct we get from the store
@@ -21,33 +21,6 @@ pub struct BatchInfo {
     created_at: i64,
     batch_status: Option<BatchStatus>,
     batch: String, // placeholder
-}
-
-// Move this out of this file
-pub trait BatchQueueStrategy {
-    fn new(store: StoreAbstraction) -> Self;
-
-    // Retrieves the next batch from the queue
-    fn next_batch(&mut self) -> Option<BatchSubmission>;
-
-    // Replenishes the queue according to the strategy
-    // May be able to have a default implementation
-    fn replenish_queue(&mut self);
-
-    // TODO: Figure out how to make this less weird
-    fn run_strategy(store: &StoreAbstraction) -> Vec<BatchSubmission>;
-
-    // This should not be part of this trait
-    // TODO: Figure out a better place for this
-    fn get_service_ids(batch_candidates: &Vec<BatchInfo>) -> Vec<String> {
-        let mut services = batch_candidates
-            .iter()
-            .map(|b| b.service_id.clone())
-            .collect::<Vec<String>>();
-        services.sort_unstable();
-        services.dedup();
-        services
-    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -92,15 +65,8 @@ pub struct BatchQueueStrategyOneRoundSerial {
     queue: Vec<BatchSubmission>,
 }
 
-impl BatchQueueStrategy for BatchQueueStrategyOneRoundSerial {
-    fn new(store: StoreAbstraction) -> BatchQueueStrategyOneRoundSerial {
-        BatchQueueStrategyOneRoundSerial {
-            store: store,
-            queue: Vec::new(),
-        }
-    }
-
-    fn next_batch(&mut self) -> Option<BatchSubmission> {
+impl Iterator<Item = BatchSubmission> for BatchQueueStrategyOneRoundSerial {
+    fn next(&mut self) -> Option<BatchSubmission> {
         let next = self.queue.pop();
         match next {
             Some(b) => Some(b),
@@ -109,6 +75,15 @@ impl BatchQueueStrategy for BatchQueueStrategyOneRoundSerial {
                 // Returns None if there are no batches to queue
                 self.queue.pop()
             }
+        }
+    }
+}
+
+impl BatchQueueStrategyOneRoundSerial {
+    fn new(store: StoreAbstraction) -> BatchQueueStrategyOneRoundSerial {
+        BatchQueueStrategyOneRoundSerial {
+            store: store,
+            queue: Vec::new(),
         }
     }
 
@@ -135,6 +110,37 @@ impl BatchQueueStrategy for BatchQueueStrategyOneRoundSerial {
                     .collect::<Vec<&BatchInfo>>();
                 // Finds the oldest created_at, then the batch with that timestamp
                 // This avoids implementing PartialOrd and Ord on many structs
+
+// TODO: WORKING HERE
+
+                if let Some(oldest_batch_created_at) =
+                    service_queue.iter().map(|b| b.created_at).min()
+                {
+                    let mut next_batch = service_queue
+                        .iter()
+                        .filter(|b| b.created_at == oldest_batch_created_at)
+                        .map(|b| *b)
+                        .collect::<Vec<&BatchInfo>>();
+                    if next_batch.len() == 1 {
+                        if let Some(batch) = next_batch.pop() {
+                            batch_queue.push(batch.clone());
+                        }
+                    } else if next_batch.len() > 1 {
+                        if let Some(first_batch) =
+                            next_batch.iter().map(|b| b.header_signature.clone()).min()
+                        {
+                            match next_batch
+                                .iter()
+                                .find(|b| b.header_signature == first_batch)
+                            {
+                                Some(b) => batch_queue.push(batch.clone()),
+                                None => {} // TODO: Log this error!
+                            }
+                        }
+                    }
+                }
+
+                /*
                 if service_queue.len() > 0 {
                     let oldest_batch_created_at =
                         // TODO Do something about this unwrap
@@ -166,7 +172,7 @@ impl BatchQueueStrategy for BatchQueueStrategyOneRoundSerial {
                             batch_queue.push(batch.clone());
                         }
                     }
-                }
+                }*/
             }
         }
 
@@ -177,10 +183,8 @@ impl BatchQueueStrategy for BatchQueueStrategyOneRoundSerial {
                 abstraction: b.batch.clone(),
             })
             .collect::<Vec<BatchSubmission>>()
-
     }
 }
-
 
 // TESTS ----------------------
 
@@ -302,7 +306,6 @@ mod tests {
             });
             mock_batches
         }
-
     }
 
     #[test]
@@ -473,6 +476,4 @@ mod tests {
             ]
         )
     }
-
 }
-
