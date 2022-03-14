@@ -1,0 +1,70 @@
+// Copyright 2022 Cargill Incorporated
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// SUBMITTER MODULE
+//
+// Contains the traits and implementations for submitting batches to a DLT
+
+use crate::error::InternalError;
+
+pub trait Addresser {
+    fn address(&self, value: Option<String>) -> Result<String, InternalError>;
+}
+
+pub trait SubmitterObserver {
+    fn notify(&self, id: String, status: Option<u16>, message: Option<String>);
+}
+
+pub trait Submitter<'a> {
+    fn start(
+        addresser: Box<dyn Addresser + Send>,
+        queue: Box<dyn Iterator<Item = BatchSubmission> + Send>,
+        observer: Box<dyn SubmitterObserver + Send>,
+    ) -> Result<Box<Self>, InternalError>;
+
+    fn shutdown(self) -> Result<(), InternalError>;
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct BatchSubmission {
+    id: String,
+    service_id: Option<String>,
+    serialized_batch: Vec<u8>,
+}
+
+impl BatchSubmission {
+    pub fn new(id: String, service_id: Option<String>, serialized_batch: Vec<u8>) -> Self {
+        Self {
+            id,
+            service_id,
+            serialized_batch,
+        }
+    }
+
+    pub fn id(&self) -> &String {
+        &self.id
+    }
+
+    pub fn service_id(&self) -> &Option<String> {
+        &self.service_id
+    }
+
+    pub fn serialized_batch(&self) -> &Vec<u8> {
+        &self.serialized_batch
+    }
+}
+
+pub mod addresser;
+pub mod batch_submitter;
+pub mod observer;

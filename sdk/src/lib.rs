@@ -63,6 +63,8 @@ pub mod rest_api;
 #[cfg(feature = "schema")]
 pub mod schema;
 pub mod store;
+#[cfg(feature = "submitter")]
+pub mod submitter;
 #[cfg(feature = "track-and-trace")]
 pub mod track_and_trace;
 #[cfg(feature = "workflow")]
