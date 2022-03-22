@@ -13,7 +13,7 @@ pub struct BatchSubmission {
 
 // This is the per-batch struct we get from the store
 // TODO: Determine what struct will come from the store
-#[derive(Debug, Clone, Eq, PartialEq)]
+/*#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct BatchInfo {
     service_id: String,
     submitted: bool,
@@ -21,6 +21,44 @@ pub struct BatchInfo {
     created_at: i64,
     batch_status: Option<BatchStatus>,
     batch: String, // placeholder
+}*/
+
+// This is what we get from the store
+pub struct TrackingBatch {
+    service_id: String,
+    batch_header: String,
+    data_change_id: Option<String>,
+    signer_public_key: String,
+    trace: bool,
+    serialized_batch: Vec<u8>,
+    submitted: bool,
+    created_at: i64,
+    transactions: Vec<TrackingTransaction>,
+    batch_status: Option<BatchStatus>,
+    submission_error: Option<SubmissionError>,
+}
+
+pub struct TrackingTransaction {
+    family_name: String,
+    family_version: String,
+    payload: Vec<u8>,
+    signer_public_key: String,
+    service_id: String,
+}
+
+pub struct SubmissionError {
+    error_type: String,
+    error_message: String,
+}
+
+impl SubmissionError {
+    pub fn error_type(&self) -> &str {
+        &self.error_type
+    }
+
+    pub fn error_message(&self) -> &str {
+        &self.error_message
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -36,11 +74,11 @@ enum BatchStatus {
 // For testing/dev only
 #[derive(Debug, Eq, PartialEq)]
 pub struct StoreAbstraction {
-    batches: Vec<BatchInfo>,
+    batches: Vec<TrackingBatch>,
 }
 
 impl StoreAbstraction {
-    fn mock_new(mock_batches: Vec<BatchInfo>) -> StoreAbstraction {
+    fn mock_new(mock_batches: Vec<TrackingBatch>) -> StoreAbstraction {
         StoreAbstraction {
             batches: mock_batches,
         }
@@ -52,7 +90,7 @@ impl StoreAbstraction {
         }
     }
 
-    fn get_batches(&self) -> Vec<BatchInfo> {
+    fn get_batches(&self) -> Vec<TrackingBatch> {
         self.batches.clone()
     }
 }
@@ -93,7 +131,7 @@ impl BatchQueueStrategyOneRoundSerial {
 
     fn run_strategy(store: &StoreAbstraction) -> Vec<BatchSubmission> {
         let batch_candidates = store.get_batches();
-        let mut batch_queue: Vec<BatchInfo> = Vec::new();
+        let mut batch_queue: Vec<TrackingBatch> = Vec::new();
 
         // Get a list of the service_ids
         let services = Self::get_service_ids(&batch_candidates);
@@ -107,11 +145,11 @@ impl BatchQueueStrategyOneRoundSerial {
                 let service_queue = batch_candidates
                     .iter()
                     .filter(|b| b.service_id == id)
-                    .collect::<Vec<&BatchInfo>>();
+                    .collect::<Vec<&TrackingBatch>>();
                 // Finds the oldest created_at, then the batch with that timestamp
                 // This avoids implementing PartialOrd and Ord on many structs
 
-// TODO: WORKING HERE
+                // TODO: WORKING HERE
 
                 if let Some(oldest_batch_created_at) =
                     service_queue.iter().map(|b| b.created_at).min()
@@ -120,7 +158,7 @@ impl BatchQueueStrategyOneRoundSerial {
                         .iter()
                         .filter(|b| b.created_at == oldest_batch_created_at)
                         .map(|b| *b)
-                        .collect::<Vec<&BatchInfo>>();
+                        .collect::<Vec<&TrackingBatch>>();
                     if next_batch.len() == 1 {
                         if let Some(batch) = next_batch.pop() {
                             batch_queue.push(batch.clone());
@@ -179,8 +217,9 @@ impl BatchQueueStrategyOneRoundSerial {
         batch_queue
             .iter()
             .map(|b| BatchSubmission {
+                id: b.batch_header.clone(),
                 service_id: b.service_id.clone(),
-                abstraction: b.batch.clone(),
+                serialized_batch: b.serialized_batch.clone(),
             })
             .collect::<Vec<BatchSubmission>>()
     }
@@ -197,83 +236,128 @@ mod tests {
     };
 
     struct MockBatches {
-        batches: Vec<BatchInfo>,
+        batches: Vec<TrackingBatch>,
     }
     impl MockBatches {
         fn new_set() -> MockBatches {
             MockBatches {
                 batches: vec![
-                    BatchInfo {
-                        service_id: "abcd-1234".to_string(),
+                    TrackingBatch {
+                        service_id: "abcd-1234".to_string,
+                        batch_header: "b1_1234567890abcdef".to_string(),
+                        data_change_id: None,
+                        signer_public_key: "0".to_string(),
+                        trace: false,
+                        serialized_batch: vec![1, 1, 1, 1],
                         submitted: false,
-                        header_signature: "b1_1234567890abcdef".to_string(),
                         created_at: 10001,
+                        transactions: Vec::new(),
                         batch_status: None,
-                        batch: "Here's test batch 1".to_string(),
+                        submission_error: None,
                     },
-                    BatchInfo {
-                        service_id: "abcd-1234".to_string(),
+                    TrackingBatch {
+                        service_id: "abcd-1234".to_string,
+                        batch_header: "b2_1234567890abcdef".to_string(),
+                        data_change_id: None,
+                        signer_public_key: "0".to_string(),
+                        trace: false,
+                        serialized_batch: vec![2, 2, 2, 2],
                         submitted: false,
-                        header_signature: "b2_1234567890abcdef".to_string(),
                         created_at: 10002,
+                        transactions: Vec::new(),
                         batch_status: None,
-                        batch: "Here's test batch 2".to_string(),
+                        submission_error: None,
                     },
-                    BatchInfo {
+                    TrackingBatch {
                         service_id: "efgh-5678".to_string(),
+                        batch_header: "b3_1234567890abcdef".to_string(),
+                        data_change_id: None,
+                        signer_public_key: "0".to_string(),
+                        trace: false,
+                        serialized_batch: vec![3, 3, 3, 3],
                         submitted: false,
-                        header_signature: "b3_1234567890abcdef".to_string(),
                         created_at: 10003,
+                        transactions: Vec::new(),
                         batch_status: None,
-                        batch: "Here's test batch 3".to_string(),
+                        submission_error: None,
                     },
-                    BatchInfo {
+                    TrackingBatch {
                         service_id: "efgh-5678".to_string(),
+                        batch_header: "b4_1234567890abcdef".to_string(),
+                        data_change_id: None,
+                        signer_public_key: "0".to_string(),
+                        trace: false,
+                        serialized_batch: vec![4, 4, 4, 4],
                         submitted: false,
-                        header_signature: "b4_1234567890abcdef".to_string(),
                         created_at: 10004,
+                        transactions: Vec::new(),
                         batch_status: None,
-                        batch: "Here's test batch 4".to_string(),
+                        submission_error: None,
                     },
-                    BatchInfo {
-                        service_id: "abcd-1234".to_string(),
+                    TrackingBatch {
+                        service_id: "abcd-1234".to_string,
+                        batch_header: "b5_1234567890abcdef".to_string(),
+                        data_change_id: None,
+                        signer_public_key: "0".to_string(),
+                        trace: false,
+                        serialized_batch: vec![5, 5, 5, 5],
                         submitted: false,
-                        header_signature: "b5_1234567890abcdef".to_string(),
                         created_at: 10005,
+                        transactions: Vec::new(),
                         batch_status: None,
-                        batch: "Here's test batch 5".to_string(),
+                        submission_error: None,
                     },
-                    BatchInfo {
+                    TrackingBatch {
                         service_id: "ayay-1212".to_string(),
+                        batch_header: "b6_1234567890abcdef".to_string(),
+                        data_change_id: None,
+                        signer_public_key: "0".to_string(),
+                        trace: false,
+                        serialized_batch: vec![6, 6, 6, 6],
                         submitted: false,
-                        header_signature: "b6_1234567890abcdef".to_string(),
                         created_at: 10006,
+                        transactions: Vec::new(),
                         batch_status: None,
-                        batch: "Here's test batch 6".to_string(),
+                        submission_error: None,
                     },
-                    BatchInfo {
-                        service_id: "abcd-1234".to_string(),
+                    TrackingBatch {
+                        service_id: "abcd-1234".to_string,
+                        batch_header: "b7_1234567890abcdef".to_string(),
+                        data_change_id: None,
+                        signer_public_key: "0".to_string(),
+                        trace: false,
+                        serialized_batch: vec![7, 7, 7, 7],
                         submitted: false,
-                        header_signature: "b7_1234567890abcdef".to_string(),
                         created_at: 10007,
+                        transactions: Vec::new(),
                         batch_status: None,
-                        batch: "Here's test batch 7".to_string(),
+                        submission_error: None,
                     },
-                    BatchInfo {
+                    TrackingBatch {
                         service_id: "ayay-1212".to_string(),
+                        batch_header: "b8_1234567890abcdef".to_string(),
+                        data_change_id: None,
+                        signer_public_key: "0".to_string(),
+                        trace: false,
+                        serialized_batch: vec![8, 8, 8, 8],
                         submitted: false,
-                        header_signature: "b8_1234567890abcdef".to_string(),
                         created_at: 10008,
+                        transactions: Vec::new(),
                         batch_status: None,
-                        batch: "Here's test batch 8".to_string(),
+                        submission_error: None,
                     },
-                    BatchInfo {
+                    TrackingBatch {
                         service_id: "ayay-1212".to_string(),
+                        batch_header: "b9_1234567890abcdef".to_string(),
+                        data_change_id: None,
+                        signer_public_key: "0".to_string(),
+                        trace: false,
+                        serialized_batch: vec![9, 9, 9, 9],
                         submitted: false,
-                        header_signature: "b9_1234567890abcdef".to_string(),
                         created_at: 10009,
+                        transactions: Vec::new(),
                         batch_status: None,
-                        batch: "Here's test batch 9".to_string(),
+                        submission_error: None,
                     },
                 ],
             }
@@ -281,13 +365,18 @@ mod tests {
 
         fn new_set_w_pending() -> MockBatches {
             let mut mock_batches = MockBatches::new_set();
-            mock_batches.batches.push(BatchInfo {
-                service_id: "abcd-1234".to_string(),
-                submitted: true,
-                header_signature: "b0_1234567890abcdef".to_string(),
+            mock_batches.batches.push(TrackingBatch {
+                service_id: "abcd-1234".to_string,
+                batch_header: "b0_1234567890abcdef".to_string(),
+                data_change_id: None,
+                signer_public_key: "0".to_string(),
+                trace: false,
+                serialized_batch: vec![0, 0, 0, 0],
+                submitted: false,
                 created_at: 10000,
+                transactions: Vec::new(),
                 batch_status: Some(BatchStatus::Pending),
-                batch: "Here's test batch 0".to_string(),
+                submission_error: None,
             });
             mock_batches
         }
@@ -296,13 +385,18 @@ mod tests {
             // Creates a batch that was submitted at the same time as batch 1
             // This batch should be submitted first
             let mut mock_batches = MockBatches::new_set();
-            mock_batches.batches.push(BatchInfo {
-                service_id: "abcd-1234".to_string(),
+            mock_batches.batches.push(TrackingBatch {
+                service_id: "abcd-1234".to_string,
+                batch_header: "b0_1234567890abcdef".to_string(),
+                data_change_id: None,
+                signer_public_key: "0".to_string(),
+                trace: false,
+                serialized_batch: vec![0, 0, 0, 0],
                 submitted: false,
-                header_signature: "b0_1234567890abcdef".to_string(),
                 created_at: 10001,
+                transactions: Vec::new(),
                 batch_status: Some(BatchStatus::Unknown),
-                batch: "Here's test batch 0".to_string(),
+                submission_error: None,
             });
             mock_batches
         }
@@ -326,15 +420,17 @@ mod tests {
         let mut test_queue = BatchQueueStrategyOneRoundSerial {
             store: StoreAbstraction::mock_empty(),
             queue: vec![BatchSubmission {
+                id: "abcd".to_string(),
                 service_id: "abcd-1234".to_string(),
-                abstraction: "Here's a test batch".to_string(),
+                serialized_batch: vec![1, 1, 1, 1],
             }],
         };
         assert_eq!(
             test_queue.next_batch(),
             Some(BatchSubmission {
+                id: "b1_1234567890abcdef".to_string(),
                 service_id: "abcd-1234".to_string(),
-                abstraction: "Here's a test batch".to_string()
+                serialized_batch: vec![1, 1, 1, 1],
             })
         )
     }
@@ -350,13 +446,18 @@ mod tests {
 
     #[test]
     fn test_batch_queue_strategy_one_round_serial_next_batch_empty_w_replen() {
-        let mock_batches = vec![BatchInfo {
-            service_id: "abcd-1234".to_string(),
+        let mock_batches = vec![TrackingBatch {
+            service_id: "abcd-1234".to_string,
+            batch_header: "b1_1234567890abcdef".to_string(),
+            data_change_id: None,
+            signer_public_key: "0".to_string(),
+            trace: false,
+            serialized_batch: vec![1, 1, 1, 1],
             submitted: false,
-            header_signature: "1234567890abcdef".to_string(),
             created_at: 10001,
+            transactions: Vec::new(),
             batch_status: None,
-            batch: "Here's a test batch".to_string(),
+            submission_error: None,
         }];
         let mut test_queue = BatchQueueStrategyOneRoundSerial {
             store: StoreAbstraction::mock_new(mock_batches),
@@ -366,8 +467,9 @@ mod tests {
         assert_eq!(
             test_queue.next_batch(),
             Some(BatchSubmission {
+                id: "b1_1234567890abcdef".to_string(),
                 service_id: "abcd-1234".to_string(),
-                abstraction: "Here's a test batch".to_string()
+                serialized_batch: vec![1, 1, 1, 1],
             })
         )
     }
@@ -410,16 +512,19 @@ mod tests {
             BatchQueueStrategyOneRoundSerial::run_strategy(&test_queue.store),
             vec![
                 BatchSubmission {
+                    id: "b1_1234567890abcdef".to_string(),
                     service_id: "abcd-1234".to_string(),
-                    abstraction: "Here's test batch 1".to_string()
+                    serialized_batch: vec![1, 1, 1, 1],
                 },
                 BatchSubmission {
+                    id: "b6_1234567890abcdef".to_string(),
                     service_id: "ayay-1212".to_string(),
-                    abstraction: "Here's test batch 6".to_string()
+                    serialized_batch: vec![6, 6, 6, 6],
                 },
                 BatchSubmission {
+                    id: "b3_1234567890abcdef".to_string(),
                     service_id: "efgh-5678".to_string(),
-                    abstraction: "Here's test batch 3".to_string()
+                    serialized_batch: vec![3, 3, 3, 3],
                 },
             ]
         )
@@ -438,12 +543,14 @@ mod tests {
             BatchQueueStrategyOneRoundSerial::run_strategy(&test_queue.store),
             vec![
                 BatchSubmission {
+                    id: "b6_1234567890abcdef".to_string(),
                     service_id: "ayay-1212".to_string(),
-                    abstraction: "Here's test batch 6".to_string()
+                    serialized_batch: vec![6, 6, 6, 6],
                 },
                 BatchSubmission {
+                    id: "b3_1234567890abcdef".to_string(),
                     service_id: "efgh-5678".to_string(),
-                    abstraction: "Here's test batch 3".to_string()
+                    serialized_batch: vec![3, 3, 3, 3],
                 },
             ]
         )
@@ -462,16 +569,19 @@ mod tests {
             BatchQueueStrategyOneRoundSerial::run_strategy(&test_queue.store),
             vec![
                 BatchSubmission {
+                    id: "b0_1234567890abcdef".to_string(),
                     service_id: "abcd-1234".to_string(),
-                    abstraction: "Here's test batch 0".to_string()
+                    serialized_batch: vec![0, 0, 0, 0],
                 },
                 BatchSubmission {
+                    id: "b6_1234567890abcdef".to_string(),
                     service_id: "ayay-1212".to_string(),
-                    abstraction: "Here's test batch 6".to_string()
+                    serialized_batch: vec![6, 6, 6, 6],
                 },
                 BatchSubmission {
+                    id: "b3_1234567890abcdef".to_string(),
                     service_id: "efgh-5678".to_string(),
-                    abstraction: "Here's test batch 3".to_string()
+                    serialized_batch: vec![3, 3, 3, 3],
                 },
             ]
         )
