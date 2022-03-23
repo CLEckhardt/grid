@@ -27,16 +27,17 @@ pub use error::{BatchBuilderError, BatchTrackingStoreError};
 
 const NON_SPLINTER_SERVICE_ID_DEFAULT: &str = "----";
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum BatchStatus {
     Unknown,
     Pending,
+    Delayed,
     Invalid(Vec<InvalidTransaction>),
     Valid(Vec<ValidTransaction>),
     Committed(Vec<ValidTransaction>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct InvalidTransaction {
     transaction_id: String,
     error_message: String,
@@ -112,7 +113,7 @@ impl InvalidTransactionBuilder {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct ValidTransaction {
     transaction_id: String,
 }
@@ -203,6 +204,7 @@ impl SubmissionErrorBuilder {
     }
 }
 
+#[derive(Clone)]
 pub struct TrackingBatch {
     service_id: String,
     batch_header: String,
@@ -407,6 +409,7 @@ pub struct TrackingBatchList {
     pub batches: Vec<TrackingBatch>,
 }
 
+#[derive(Clone)]
 pub struct TrackingTransaction {
     family_name: String,
     family_version: String,

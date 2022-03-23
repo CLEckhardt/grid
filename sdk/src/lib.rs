@@ -58,6 +58,8 @@ pub mod protocol;
 pub mod protos;
 #[cfg(feature = "purchase-order")]
 pub mod purchase_order;
+#[cfg(feature = "queuing")]
+pub mod queuing;
 #[cfg(feature = "rest-api")]
 pub mod rest_api;
 #[cfg(feature = "schema")]
