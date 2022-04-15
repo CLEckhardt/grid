@@ -78,6 +78,7 @@ impl SubmissionResponse {
     }
 }
 
+#[derive(Debug, PartialEq)]
 // A message about a batch; sent between threads
 enum BatchMessage {
     SubmissionNotification(String),
@@ -118,6 +119,7 @@ impl fmt::Debug for NewTask {
     }
 }
 
+#[derive(Debug, PartialEq)]
 // Communicates an errror message from the task handler to the listener thread
 struct ErrorResponse {
     id: String,
@@ -419,6 +421,42 @@ impl Submitter<'_> for BatchSubmitter {
 mod tests {
 
     use super::{super::addresser::BatchAddresser, *};
+    use actix_web::{post, rt, App, HttpResponse, HttpServer, Responder};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // Implement a crude "random" Bernoulli distribution sampler for the /echo_maybe endpoint
+    // Avoids importing the rand crate, and this doesn't need to be a good random sampler
+    // Returns true roughly 1/3 of the time
+    fn poorly_random() -> bool {
+        let now = SystemTime::now();
+        let time = now.duration_since(UNIX_EPOCH).unwrap().as_micros();
+        (time % 3) == 0
+    }
+
+    // endpoints for rest APIs uses in tests
+    #[post("/echo")]
+    async fn echo(req_body: String) -> impl Responder {
+        HttpResponse::Ok().body(req_body)
+    }
+
+    #[post("/echo_maybe")]
+    async fn echo_maybe(req_body: String) -> impl Responder {
+        let v = poorly_random();
+        if v {
+            println!("ok");
+            HttpResponse::Ok().body(req_body)
+        } else {
+            println!("try again!");
+            HttpResponse::ServiceUnavailable().finish()
+        }
+    }
+
+    async fn run_rest_api(port: &str) -> std::io::Result<()> {
+        HttpServer::new(|| App::new().service(echo).service(echo_maybe))
+            .bind(format!("127.0.0.1:{}", port))?
+            .run()
+            .await
+    }
 
     #[test]
     fn test_batch_submitter_batch_envelope_create() {
@@ -505,6 +543,42 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn test_batch_submitter_submission_command_execute() {
+        // Test batch with echo endpoint
+        let test_batch_envelope = BatchEnvelope {
+            id: "123-abc".to_string(),
+            address: "http://127.0.0.1:8085/echo".to_string(),
+            payload: vec![1, 1, 1, 1],
+        };
+        let mut test_submission_command = SubmissionCommand::new(test_batch_envelope);
+
+        let expected_response = SubmissionResponse::new(
+            "123-abc".to_string(),
+            200,
+            "\u{1}\u{1}\u{1}\u{1}".to_string(),
+            1,
+        );
+
+        // Start REST API
+        std::thread::Builder::new()
+            .name("test_rest_api_runtime".to_string())
+            .spawn(move || {
+                rt::System::new("rest_api").block_on(async { run_rest_api("8085").await.unwrap() })
+            })
+            .unwrap();
+
+        let test_execute = Builder::new_current_thread()
+            .thread_name("test_thread_submission_command")
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move { test_submission_command.execute().await.unwrap() });
+
+        assert_eq!(test_execute, expected_response);
+    }
+
+    #[test]
     fn test_batch_submitter_submission_controller_new() {
         let test_batch_envelope = BatchEnvelope {
             id: "123-abc".to_string(),
@@ -525,5 +599,173 @@ mod tests {
                 }
             }
         )
+    }
+
+    #[test]
+    fn test_batch_submitter_submission_controller_run() {
+        // Test batch with echo endpoint
+        let test_batch_envelope_1 = BatchEnvelope {
+            id: "123-abc".to_string(),
+            address: "http://127.0.0.1:8086/echo".to_string(),
+            payload: vec![1, 1, 1, 1],
+        };
+        let mut test_submission_controller_1 = SubmissionController::new(test_batch_envelope_1);
+
+        // Test batch with echo_maybe endpoint to test retry behavior
+        let test_batch_envelope_2 = BatchEnvelope {
+            id: "123-abc".to_string(),
+            address: "http://127.0.0.1:8086/echo_maybe".to_string(),
+            payload: vec![1, 1, 1, 1],
+        };
+        let mut test_submission_controller_2 = SubmissionController::new(test_batch_envelope_2);
+
+        let expected_response = SubmissionResponse::new(
+            "123-abc".to_string(),
+            200,
+            "\u{1}\u{1}\u{1}\u{1}".to_string(),
+            1,
+        );
+
+        // Start REST API
+        std::thread::Builder::new()
+            .name("submitter_async_runtime_host".to_string())
+            .spawn(move || {
+                rt::System::new("rest_api").block_on(async { run_rest_api("8086").await.unwrap() })
+            })
+            .unwrap();
+
+        let test_run_1 = Builder::new_current_thread()
+            .thread_name("test_thread_submission_controller_run_1")
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move { test_submission_controller_1.run().await.unwrap() });
+
+        let test_run_2 = Builder::new_current_thread()
+            .thread_name("test_thread_submission_controller_run_2")
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move { test_submission_controller_2.run().await.unwrap() });
+
+        assert_eq!(test_run_1, expected_response);
+
+        assert_eq!(test_run_2.id, expected_response.id);
+        assert_eq!(test_run_2.status, expected_response.status);
+        assert_eq!(test_run_2.message, expected_response.message);
+        assert!(test_run_2.attempts >= 1 && test_run_2.attempts <= 10);
+    }
+
+    #[test]
+    fn test_batch_submitter_task_handler_spawn() {
+        // Test batch with echo endpoint
+        let test_batch_envelope = BatchEnvelope {
+            id: "123-abc".to_string(),
+            address: "http://127.0.0.1:8087/echo".to_string(),
+            payload: vec![1, 1, 1, 1],
+        };
+        let expected_response = SubmissionResponse::new(
+            "123-abc".to_string(),
+            200,
+            "\u{1}\u{1}\u{1}\u{1}".to_string(),
+            1,
+        );
+
+        // Start REST API
+        std::thread::Builder::new()
+            .name("rest_api".to_string())
+            .spawn(move || {
+                rt::System::new("rest_api").block_on(async { run_rest_api("8087").await.unwrap() })
+            })
+            .unwrap();
+
+        let (tx, rx): (
+            std::sync::mpsc::Sender<BatchMessage>,
+            std::sync::mpsc::Receiver<BatchMessage>,
+        ) = std::sync::mpsc::channel();
+
+        let new_task = NewTask::new(tx, test_batch_envelope);
+
+        let runtime = Builder::new_current_thread()
+            .thread_name("test_thread_task_handler")
+            .enable_all()
+            .build()
+            .unwrap();
+
+        std::thread::Builder::new()
+            .name("test_thread".to_string())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    tokio::spawn(TaskHandler::spawn(new_task));
+                    // Let the above task finish before dropping the runtime
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await
+                })
+            })
+            .unwrap();
+
+        let response = rx.recv().unwrap();
+
+        assert_eq!(
+            response,
+            BatchMessage::SubmissionResponse(expected_response)
+        );
+    }
+
+    struct MockObserver {
+        tx: std::sync::mpsc::Sender<(String, Option<u16>, Option<String>)>,
+    }
+
+    impl SubmitterObserver for MockObserver {
+        fn notify(&self, id: String, status: Option<u16>, message: Option<String>) {
+            let _ = self.tx.send((id, status, message));
+        }
+    }
+
+    #[test]
+    fn test_batch_submitter_submitter_service() {
+        // Start REST API
+        std::thread::Builder::new()
+            .name("rest_api".to_string())
+            .spawn(move || {
+                rt::System::new("rest_api").block_on(async { run_rest_api("8088").await.unwrap() })
+            })
+            .unwrap();
+
+        let addresser = Box::new(BatchAddresser::new("http://127.0.0.1:8088/echo", None));
+
+        let batch_queue = Box::new(
+            vec![BatchSubmission {
+                id: "batch_without_service_id".to_string(),
+                service_id: None,
+                serialized_batch: vec![1, 1, 1, 1],
+            }]
+            .into_iter(),
+        );
+
+        // Channel to get what the mock observer receives
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let observer = Box::new(MockObserver { tx });
+
+        let submitter = BatchSubmitter::start(addresser, batch_queue, observer).unwrap();
+
+        // Listen for the response from the observer
+        // First response is a notification that the submitter is processing the batch
+        let first_response = rx.recv().unwrap();
+        let first_expected_response: (String, Option<u16>, Option<String>) =
+            ("batch_without_service_id".to_string(), Some(0), None);
+
+        // Second response is the submission response
+        let second_response = rx.recv().unwrap();
+        let second_expected_response: (String, Option<u16>, Option<String>) = (
+            "batch_without_service_id".to_string(),
+            Some(200),
+            Some("\u{1}\u{1}\u{1}\u{1}".to_string()),
+        );
+
+        submitter.shutdown().unwrap();
+
+        assert_eq!(first_response, first_expected_response);
+        assert_eq!(second_response, second_expected_response);
     }
 }
