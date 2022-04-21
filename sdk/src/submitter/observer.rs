@@ -14,7 +14,7 @@
 
 //! Interprets messages from the submitter about batches and updates the store accordingly.
 
-use super::SubmitterObserver;
+use super::{SubmitterObserver, TrackingId};
 use crate::batch_tracking::store::BatchTrackingStore;
 
 #[allow(dead_code)]
@@ -23,8 +23,8 @@ pub struct BatchTrackingObserver {
 }
 
 #[allow(unused_variables)]
-impl SubmitterObserver for BatchTrackingObserver {
-    fn notify(&self, id: String, status: Option<u16>, message: Option<String>) {
+impl<T: TrackingId> SubmitterObserver<T> for BatchTrackingObserver {
+    fn notify(&self, id: T, status: Option<u16>, message: Option<String>) {
         if let Some(s) = status {
             match &s {
                 0 => {

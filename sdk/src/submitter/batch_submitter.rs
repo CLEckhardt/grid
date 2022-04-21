@@ -23,7 +23,7 @@ use std::{fmt, iter::Iterator, thread, time};
 use log::{error, info};
 use tokio::{runtime::Builder, sync::mpsc};
 
-use super::{Addresser, BatchSubmission, Submitter, SubmitterObserver};
+use super::{Addresser, BatchSubmission, Submitter, SubmitterObserver, TrackingId};
 use crate::error::{ClientError, InternalError};
 
 // Number of times a submitter task will retry submission in quick succession
@@ -36,17 +36,17 @@ const POLLING_INTERVAL: u64 = 1000;
 
 #[derive(Debug, Clone, PartialEq)]
 // Wraps the batch as it moves through the submitter
-struct BatchEnvelope {
-    id: String,
+struct BatchEnvelope<T: TrackingId> {
+    id: T,
     address: String,
     payload: Vec<u8>,
 }
 
 // Box must be borrowed to maintain proper ownership and lifetimes
 #[allow(clippy::borrowed_box)]
-impl BatchEnvelope {
+impl<T: TrackingId> BatchEnvelope<T> {
     fn create(
-        batch_submission: BatchSubmission,
+        batch_submission: BatchSubmission<T>,
         addresser: &Box<dyn Addresser + Send>,
     ) -> Result<Self, InternalError> {
         let address = addresser.address(batch_submission.service_id)?;
@@ -60,15 +60,15 @@ impl BatchEnvelope {
 
 #[derive(Debug, PartialEq)]
 // Carries the submission response from the http client back through the submitter to the observer
-struct SubmissionResponse {
-    id: String,
+struct SubmissionResponse<T: TrackingId> {
+    id: T,
     status: u16,
     message: String,
     attempts: u16,
 }
 
-impl SubmissionResponse {
-    fn new(id: String, status: u16, message: String, attempts: u16) -> Self {
+impl<T: TrackingId> SubmissionResponse<T> {
+    fn new(id: T, status: u16, message: String, attempts: u16) -> Self {
         Self {
             id,
             status,
@@ -80,16 +80,16 @@ impl SubmissionResponse {
 
 #[derive(Debug, PartialEq)]
 // A message about a batch; sent between threads
-enum BatchMessage {
-    SubmissionNotification(String),
-    SubmissionResponse(SubmissionResponse),
-    ErrorResponse(ErrorResponse),
+enum BatchMessage<T: TrackingId> {
+    SubmissionNotification(T),
+    SubmissionResponse(SubmissionResponse<T>),
+    ErrorResponse(ErrorResponse<T>),
 }
 
 #[derive(Debug)]
 // A message sent from the leader thread to the async runtime
-enum CentralMessage {
-    NewTask(NewTask),
+enum CentralMessage<T: TrackingId> {
+    NewTask(NewTask<T>),
     Terminate,
 }
 
@@ -102,18 +102,18 @@ enum TerminateMessage {
 // The object required for an async task to function
 // Provides the batch and a channel sender with which the task communicates back to the listener
 // thread about the batch
-struct NewTask {
-    tx: std::sync::mpsc::Sender<BatchMessage>,
-    batch_envelope: BatchEnvelope,
+struct NewTask<T: TrackingId> {
+    tx: std::sync::mpsc::Sender<BatchMessage<T>>,
+    batch_envelope: BatchEnvelope<T>,
 }
 
-impl NewTask {
-    fn new(tx: std::sync::mpsc::Sender<BatchMessage>, batch_envelope: BatchEnvelope) -> Self {
+impl<T: TrackingId> NewTask<T> {
+    fn new(tx: std::sync::mpsc::Sender<BatchMessage<T>>, batch_envelope: BatchEnvelope<T>) -> Self {
         Self { tx, batch_envelope }
     }
 }
 
-impl fmt::Debug for NewTask {
+impl<T: TrackingId> fmt::Debug for NewTask<T> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(fmt, "{:?}", self.batch_envelope)
     }
@@ -121,8 +121,8 @@ impl fmt::Debug for NewTask {
 
 #[derive(Debug, PartialEq)]
 // Communicates an errror message from the task handler to the listener thread
-struct ErrorResponse {
-    id: String,
+struct ErrorResponse<T: TrackingId> {
+    id: T,
     error: String,
 }
 
@@ -131,20 +131,20 @@ struct ErrorResponse {
 
 #[derive(Debug, PartialEq)]
 // Responsible for executing the submission request
-struct SubmissionCommand {
-    batch_envelope: BatchEnvelope,
+struct SubmissionCommand<T: TrackingId> {
+    batch_envelope: BatchEnvelope<T>,
     attempts: u16,
 }
 
-impl SubmissionCommand {
-    fn new(batch_envelope: BatchEnvelope) -> Self {
+impl<T: TrackingId> SubmissionCommand<T> {
+    fn new(batch_envelope: BatchEnvelope<T>) -> Self {
         Self {
             batch_envelope,
             attempts: 0,
         }
     }
 
-    async fn execute(&mut self) -> Result<SubmissionResponse, reqwest::Error> {
+    async fn execute(&mut self) -> Result<SubmissionResponse<T>, reqwest::Error> {
         let client = reqwest::Client::builder()
             .timeout(time::Duration::from_secs(15))
             .build()?;
@@ -168,20 +168,21 @@ impl SubmissionCommand {
 
 #[derive(Debug, PartialEq)]
 // Responsible for controlling retry behavior
-struct SubmissionController {
-    command: SubmissionCommand,
+struct SubmissionController<T: TrackingId> {
+    command: SubmissionCommand<T>,
 }
 
-impl SubmissionController {
-    fn new(batch_envelope: BatchEnvelope) -> Self {
+impl<T: TrackingId> SubmissionController<T> {
+    fn new(batch_envelope: BatchEnvelope<T>) -> Self {
         Self {
             command: SubmissionCommand::new(batch_envelope),
         }
     }
 
-    async fn run(&mut self) -> Result<SubmissionResponse, ClientError> {
+    async fn run(&mut self) -> Result<SubmissionResponse<T>, ClientError> {
         let mut wait: u64 = 250;
-        let mut response = self.command.execute().await;
+        let mut response: Result<SubmissionResponse<T>, reqwest::Error> =
+            self.command.execute().await;
         for _ in 1..RETRY_ATTEMPTS {
             match &response {
                 Ok(res) => match &res.status {
@@ -214,9 +215,10 @@ impl SubmissionController {
 struct TaskHandler;
 
 impl TaskHandler {
-    async fn spawn(task: NewTask) {
+    async fn spawn<T: TrackingId>(task: NewTask<T>) {
         let id = task.batch_envelope.id.clone();
-        let submission = SubmissionController::new(task.batch_envelope).run().await;
+        let submission: Result<SubmissionResponse<T>, ClientError> =
+            SubmissionController::new(task.batch_envelope).run().await;
 
         let task_message = match submission {
             Ok(s) => BatchMessage::SubmissionResponse(s),
@@ -254,10 +256,10 @@ impl Submitter<'_> for BatchSubmitter {
     ///
     /// Note that the submitter consumes the addresser, queuer, and observer.
     /// These are each moved to separate threads within the submitter.
-    fn start<'a>(
+    fn start<'a, T: 'static + TrackingId>(
         addresser: Box<dyn Addresser + Send>,
-        mut queue: Box<dyn Iterator<Item = BatchSubmission> + Send>,
-        observer: Box<dyn SubmitterObserver + Send>,
+        mut queue: Box<dyn Iterator<Item = BatchSubmission<T>> + Send>,
+        observer: Box<dyn SubmitterObserver<T> + Send>,
     ) -> Result<Box<Self>, InternalError> {
         // Create channels for termination messages
         let (leader_tx, leader_rx) = std::sync::mpsc::channel();
@@ -265,8 +267,8 @@ impl Submitter<'_> for BatchSubmitter {
 
         // Channel for messages from the async tasks to the sync listener thread
         let (tx_submission, rx_submission): (
-            std::sync::mpsc::Sender<BatchMessage>,
-            std::sync::mpsc::Receiver<BatchMessage>,
+            std::sync::mpsc::Sender<BatchMessage<T>>,
+            std::sync::mpsc::Receiver<BatchMessage<T>>,
         ) = std::sync::mpsc::channel();
         // Clone the sender so that the leader thread can notify the listener thread that it will
         // start submitting a batch
@@ -420,9 +422,19 @@ impl Submitter<'_> for BatchSubmitter {
 #[cfg(test)]
 mod tests {
 
-    use super::{super::addresser::BatchAddresser, *};
+    use super::{
+        super::{addresser::BatchAddresser, BatchTrackingId},
+        *,
+    };
+    use crate::batch_tracking::store::{TrackingBatch, TrackingBatchBuilder};
+    use crate::hex;
     use actix_web::{post, rt, App, HttpResponse, HttpServer, Responder};
+    use cylinder::{secp256k1::Secp256k1Context, Context};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use transact::protocol::{
+        batch::BatchBuilder,
+        transaction::{HashMethod, TransactionBuilder},
+    };
 
     // Implement a crude "random" Bernoulli distribution sampler for the /echo_maybe endpoint
     // Avoids importing the rand crate, and this doesn't need to be a good random sampler
@@ -458,6 +470,62 @@ mod tests {
             .await
     }
 
+    // We should make it easier to get a mock batch
+    struct MockTrackingBatch;
+
+    static FAMILY_NAME: &str = "test_family";
+    static FAMILY_VERSION: &str = "0.1";
+    static KEY1: &str = "111111111111111111111111111111111111111111111111111111111111111111";
+    static KEY2: &str = "222222222222222222222222222222222222222222222222222222222222222222";
+    static KEY3: &str = "333333333333333333333333333333333333333333333333333333333333333333";
+    static KEY4: &str = "444444444444444444444444444444444444444444444444444444444444444444";
+    static KEY5: &str = "555555555555555555555555555555555555555555555555555555555555555555";
+    static KEY6: &str = "666666666666666666666666666666666666666666666666666666666666666666";
+    static KEY7: &str = "777777777777777777777777777777777777777777777777777777777777777777";
+    static NONCE: &str = "f9kdzz";
+    static BYTES2: [u8; 4] = [0x05, 0x06, 0x07, 0x08];
+
+    impl MockTrackingBatch {
+        fn create(service_id: String) -> TrackingBatch {
+            let context = Secp256k1Context::new();
+            let key = context.new_random_private_key();
+            let signer = context.new_signer(key);
+
+            let pair = TransactionBuilder::new()
+                .with_batcher_public_key(hex::parse_hex(KEY1).unwrap())
+                .with_dependencies(vec![KEY2.to_string(), KEY3.to_string()])
+                .with_family_name(FAMILY_NAME.to_string())
+                .with_family_version(FAMILY_VERSION.to_string())
+                .with_inputs(vec![
+                    hex::parse_hex(KEY4).unwrap(),
+                    hex::parse_hex(&KEY5[0..4]).unwrap(),
+                ])
+                .with_nonce(NONCE.to_string().into_bytes())
+                .with_outputs(vec![
+                    hex::parse_hex(KEY6).unwrap(),
+                    hex::parse_hex(&KEY7[0..4]).unwrap(),
+                ])
+                .with_payload_hash_method(HashMethod::Sha512)
+                .with_payload(BYTES2.to_vec())
+                .build(&*signer)
+                .unwrap();
+
+            let batch_1 = BatchBuilder::new()
+                .with_transactions(vec![pair])
+                .build(&*signer)
+                .unwrap();
+
+            TrackingBatchBuilder::default()
+                .with_batch(batch_1)
+                .with_service_id(service_id)
+                .with_signer_public_key(KEY1.to_string())
+                .with_submitted(false)
+                .with_created_at(111111)
+                .build()
+                .unwrap()
+        }
+    }
+
     #[test]
     fn test_batch_submitter_batch_envelope_create() {
         let test_addresser_wo_serv: Box<dyn Addresser + std::marker::Send> =
@@ -466,13 +534,18 @@ mod tests {
             BatchAddresser::new("http://127.0.0.1:8080", Some("service_id")),
         );
 
+        let mock_batch_1 = MockTrackingBatch::create("".to_string());
+        let mock_batch_id_1 = BatchTrackingId::create(mock_batch_1);
+        let mock_batch_2 = MockTrackingBatch::create("123-abc".to_string());
+        let mock_batch_id_2 = BatchTrackingId::create(mock_batch_2);
+
         let test_batch_submission_wo_serv = BatchSubmission {
-            id: "batch_without_service_id".to_string(),
+            id: mock_batch_id_1.clone(),
             service_id: None,
             serialized_batch: vec![1, 1, 1, 1],
         };
         let test_batch_submission_w_serv = BatchSubmission {
-            id: "batch_with_service_id".to_string(),
+            id: mock_batch_id_2.clone(),
             service_id: Some("123-abc".to_string()),
             serialized_batch: vec![2, 2, 2, 2],
         };
@@ -484,7 +557,7 @@ mod tests {
             )
             .unwrap(),
             BatchEnvelope {
-                id: "batch_without_service_id".to_string(),
+                id: mock_batch_id_1,
                 address: "http://127.0.0.1:8080".to_string(),
                 payload: vec![1, 1, 1, 1],
             }
@@ -493,7 +566,7 @@ mod tests {
             BatchEnvelope::create(test_batch_submission_w_serv.clone(), &test_addresser_w_serv)
                 .unwrap(),
             BatchEnvelope {
-                id: "batch_with_service_id".to_string(),
+                id: mock_batch_id_2,
                 address: "http://127.0.0.1:8080?service_id=123-abc".to_string(),
                 payload: vec![2, 2, 2, 2],
             }
@@ -508,14 +581,17 @@ mod tests {
 
     #[test]
     fn test_batch_submitter_submission_response_new() {
+        let mock_batch = MockTrackingBatch::create("".to_string());
+        let mock_batch_id = BatchTrackingId::create(mock_batch);
+
         let response = SubmissionResponse::new(
-            "123-abc".to_string(),
+            mock_batch_id.clone(),
             200,
             "Everything is ok".to_string(),
             1,
         );
 
-        assert_eq!(&response.id, &"123-abc".to_string());
+        assert_eq!(&response.id, &mock_batch_id);
         assert_eq!(&response.status, &200);
         assert_eq!(&response.message, &"Everything is ok".to_string());
         assert_eq!(&response.attempts, &1);
@@ -523,8 +599,10 @@ mod tests {
 
     #[test]
     fn test_batch_submitter_submission_command_new() {
+        let mock_batch = MockTrackingBatch::create("".to_string());
+        let mock_batch_id = BatchTrackingId::create(mock_batch);
         let test_batch_envelope = BatchEnvelope {
-            id: "123-abc".to_string(),
+            id: mock_batch_id.clone(),
             address: "http://127.0.0.1:8080".to_string(),
             payload: vec![1, 1, 1, 1],
         };
@@ -533,7 +611,7 @@ mod tests {
             test_submission_command,
             SubmissionCommand {
                 batch_envelope: BatchEnvelope {
-                    id: "123-abc".to_string(),
+                    id: mock_batch_id,
                     address: "http://127.0.0.1:8080".to_string(),
                     payload: vec![1, 1, 1, 1],
                 },
@@ -543,22 +621,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_batch_submitter_submission_command_execute() {
+        let mock_batch = MockTrackingBatch::create("".to_string());
+        let mock_batch_id = BatchTrackingId::create(mock_batch);
         // Test batch with echo endpoint
         let test_batch_envelope = BatchEnvelope {
-            id: "123-abc".to_string(),
+            id: mock_batch_id.clone(),
             address: "http://127.0.0.1:8085/echo".to_string(),
             payload: vec![1, 1, 1, 1],
         };
         let mut test_submission_command = SubmissionCommand::new(test_batch_envelope);
 
-        let expected_response = SubmissionResponse::new(
-            "123-abc".to_string(),
-            200,
-            "\u{1}\u{1}\u{1}\u{1}".to_string(),
-            1,
-        );
+        let expected_response =
+            SubmissionResponse::new(mock_batch_id, 200, "\u{1}\u{1}\u{1}\u{1}".to_string(), 1);
 
         // Start REST API
         std::thread::Builder::new()
@@ -580,8 +655,10 @@ mod tests {
 
     #[test]
     fn test_batch_submitter_submission_controller_new() {
+        let mock_batch = MockTrackingBatch::create("".to_string());
+        let mock_batch_id = BatchTrackingId::create(mock_batch);
         let test_batch_envelope = BatchEnvelope {
-            id: "123-abc".to_string(),
+            id: mock_batch_id.clone(),
             address: "http://127.0.0.1:8080/echo".to_string(),
             payload: vec![1, 1, 1, 1],
         };
@@ -591,7 +668,7 @@ mod tests {
             SubmissionController {
                 command: SubmissionCommand {
                     batch_envelope: BatchEnvelope {
-                        id: "123-abc".to_string(),
+                        id: mock_batch_id.clone(),
                         address: "http://127.0.0.1:8080/echo".to_string(),
                         payload: vec![1, 1, 1, 1],
                     },
@@ -603,9 +680,11 @@ mod tests {
 
     #[test]
     fn test_batch_submitter_submission_controller_run() {
+        let mock_batch = MockTrackingBatch::create("".to_string());
+        let mock_batch_id = BatchTrackingId::create(mock_batch);
         // Test batch with echo endpoint
         let test_batch_envelope_1 = BatchEnvelope {
-            id: "123-abc".to_string(),
+            id: mock_batch_id.clone(),
             address: "http://127.0.0.1:8086/echo".to_string(),
             payload: vec![1, 1, 1, 1],
         };
@@ -613,18 +692,14 @@ mod tests {
 
         // Test batch with echo_maybe endpoint to test retry behavior
         let test_batch_envelope_2 = BatchEnvelope {
-            id: "123-abc".to_string(),
+            id: mock_batch_id.clone(),
             address: "http://127.0.0.1:8086/echo_maybe".to_string(),
             payload: vec![1, 1, 1, 1],
         };
         let mut test_submission_controller_2 = SubmissionController::new(test_batch_envelope_2);
 
-        let expected_response = SubmissionResponse::new(
-            "123-abc".to_string(),
-            200,
-            "\u{1}\u{1}\u{1}\u{1}".to_string(),
-            1,
-        );
+        let expected_response =
+            SubmissionResponse::new(mock_batch_id, 200, "\u{1}\u{1}\u{1}\u{1}".to_string(), 1);
 
         // Start REST API
         std::thread::Builder::new()
@@ -658,18 +733,16 @@ mod tests {
 
     #[test]
     fn test_batch_submitter_task_handler_spawn() {
+        let mock_batch = MockTrackingBatch::create("".to_string());
+        let mock_batch_id = BatchTrackingId::create(mock_batch);
         // Test batch with echo endpoint
         let test_batch_envelope = BatchEnvelope {
-            id: "123-abc".to_string(),
+            id: mock_batch_id.clone(),
             address: "http://127.0.0.1:8087/echo".to_string(),
             payload: vec![1, 1, 1, 1],
         };
-        let expected_response = SubmissionResponse::new(
-            "123-abc".to_string(),
-            200,
-            "\u{1}\u{1}\u{1}\u{1}".to_string(),
-            1,
-        );
+        let expected_response =
+            SubmissionResponse::new(mock_batch_id, 200, "\u{1}\u{1}\u{1}\u{1}".to_string(), 1);
 
         // Start REST API
         std::thread::Builder::new()
@@ -680,8 +753,8 @@ mod tests {
             .unwrap();
 
         let (tx, rx): (
-            std::sync::mpsc::Sender<BatchMessage>,
-            std::sync::mpsc::Receiver<BatchMessage>,
+            std::sync::mpsc::Sender<BatchMessage<BatchTrackingId>>,
+            std::sync::mpsc::Receiver<BatchMessage<BatchTrackingId>>,
         ) = std::sync::mpsc::channel();
 
         let new_task = NewTask::new(tx, test_batch_envelope);
@@ -711,18 +784,20 @@ mod tests {
         );
     }
 
-    struct MockObserver {
-        tx: std::sync::mpsc::Sender<(String, Option<u16>, Option<String>)>,
+    struct MockObserver<T: TrackingId> {
+        tx: std::sync::mpsc::Sender<(T, Option<u16>, Option<String>)>,
     }
 
-    impl SubmitterObserver for MockObserver {
-        fn notify(&self, id: String, status: Option<u16>, message: Option<String>) {
+    impl<T: TrackingId> SubmitterObserver<T> for MockObserver<T> {
+        fn notify(&self, id: T, status: Option<u16>, message: Option<String>) {
             let _ = self.tx.send((id, status, message));
         }
     }
 
     #[test]
     fn test_batch_submitter_submitter_service() {
+        let mock_batch = MockTrackingBatch::create("".to_string());
+        let mock_batch_id = BatchTrackingId::create(mock_batch);
         // Start REST API
         std::thread::Builder::new()
             .name("rest_api".to_string())
@@ -735,7 +810,7 @@ mod tests {
 
         let batch_queue = Box::new(
             vec![BatchSubmission {
-                id: "batch_without_service_id".to_string(),
+                id: mock_batch_id.clone(),
                 service_id: None,
                 serialized_batch: vec![1, 1, 1, 1],
             }]
@@ -752,13 +827,13 @@ mod tests {
         // Listen for the response from the observer
         // First response is a notification that the submitter is processing the batch
         let first_response = rx.recv().unwrap();
-        let first_expected_response: (String, Option<u16>, Option<String>) =
-            ("batch_without_service_id".to_string(), Some(0), None);
+        let first_expected_response: (BatchTrackingId, Option<u16>, Option<String>) =
+            (mock_batch_id.clone(), Some(0), None);
 
         // Second response is the submission response
         let second_response = rx.recv().unwrap();
-        let second_expected_response: (String, Option<u16>, Option<String>) = (
-            "batch_without_service_id".to_string(),
+        let second_expected_response: (BatchTrackingId, Option<u16>, Option<String>) = (
+            mock_batch_id.clone(),
             Some(200),
             Some("\u{1}\u{1}\u{1}\u{1}".to_string()),
         );

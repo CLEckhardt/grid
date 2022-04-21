@@ -14,7 +14,7 @@
 
 //! Submitter traits and implementations for submitting batches to a DLT
 
-use crate::error::InternalError;
+use crate::{batch_tracking::store::TrackingBatch, error::InternalError};
 
 pub mod addresser;
 pub mod batch_submitter;
@@ -31,10 +31,10 @@ pub trait Addresser {
 }
 
 /// An interface for interpretting and recording updates from the submitter
-pub trait SubmitterObserver {
+pub trait SubmitterObserver<T: TrackingId> {
     /// Notify the observer of an update. The interpretation and recording
     /// of the update is determined by the observer's implementation.
-    fn notify(&self, id: String, status: Option<u16>, message: Option<String>);
+    fn notify(&self, id: T, status: Option<u16>, message: Option<String>);
 }
 
 /// An interface to a submission service
@@ -44,14 +44,64 @@ pub trait SubmitterObserver {
 pub trait Submitter<'a> {
     /// Start the submission service. Return any error that occurs while
     /// initializing its implementation.
-    fn start(
+    fn start<T: 'static + TrackingId>(
         addresser: Box<dyn Addresser + Send>,
-        queue: Box<dyn Iterator<Item = BatchSubmission> + Send>,
-        observer: Box<dyn SubmitterObserver + Send>,
+        queue: Box<dyn Iterator<Item = BatchSubmission<T>> + Send>,
+        observer: Box<dyn SubmitterObserver<T> + Send>,
     ) -> Result<Box<Self>, InternalError>;
 
     /// Wind down and stop the submission service.
     fn shutdown(self) -> Result<(), InternalError>;
+}
+
+/// A generic representation of batch tracking information
+///
+/// This interface allows for different implementations of batch tracking information and metadata
+/// to flow through the submitter. `TrackingId`s are created in the queuer and interpretted in
+/// the observer.
+pub trait TrackingId:
+    Clone + std::fmt::Debug + std::fmt::Display + PartialEq + Sync + Send
+{
+    type Id;
+    /// Create the identifier.
+    fn create(batch: TrackingBatch) -> Self;
+
+    /// Get the value of the identifier, consuming the object.
+    fn get(self) -> Self::Id;
+}
+
+/// A batch tracking ID containing the `batch_header` and `service_id`
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchTrackingId {
+    batch_header: String,
+    service_id: String,
+}
+
+impl std::fmt::Display for BatchTrackingId {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "(batch_header: {}, service_id: {})",
+            self.batch_header, self.service_id
+        )
+    }
+}
+
+impl TrackingId for BatchTrackingId {
+    type Id = (String, String);
+
+    /// Create a new `BatchTrackingId`.
+    fn create(batch: TrackingBatch) -> Self {
+        Self {
+            batch_header: batch.batch_header().to_string(),
+            service_id: batch.service_id().to_string(),
+        }
+    }
+
+    /// Get the values of the `BatchTrackingId`, returned as a tuple.
+    fn get(self) -> (String, String) {
+        (self.batch_header, self.service_id)
+    }
 }
 
 /// A batch submission
@@ -66,15 +116,15 @@ pub trait Submitter<'a> {
 /// A queue will typically create a `BatchSubmission` object and deliver it to
 /// the submitter via the queue's `next()` method.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct BatchSubmission {
-    id: String,
+pub struct BatchSubmission<T: TrackingId> {
+    id: T,
     service_id: Option<String>,
     serialized_batch: Vec<u8>,
 }
 
-impl BatchSubmission {
+impl<T: TrackingId> BatchSubmission<T> {
     /// Create a new BatchSubmission.
-    pub fn new(id: String, service_id: Option<String>, serialized_batch: Vec<u8>) -> Self {
+    pub fn new(id: T, service_id: Option<String>, serialized_batch: Vec<u8>) -> Self {
         Self {
             id,
             service_id,
@@ -82,8 +132,7 @@ impl BatchSubmission {
         }
     }
 
-    /// Return the batch's `id`.
-    pub fn id(&self) -> &String {
+    pub fn id(&self) -> &T {
         &self.id
     }
 
