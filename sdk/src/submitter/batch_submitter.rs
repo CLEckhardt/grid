@@ -21,9 +21,12 @@
 use std::{fmt, iter::Iterator, thread, time};
 
 use log::{error, info};
-use tokio::{runtime::Builder, sync::mpsc};
+use tokio::runtime::Builder;
 
-use super::{Addresser, BatchSubmission, Submitter, SubmitterObserver, TrackingId};
+use super::{
+    Addresser, BatchSubmission, RunnableSubmitter, RunningSubmitter, SubmitterBuilder,
+    SubmitterObserver, TrackingId,
+};
 use crate::error::{ClientError, InternalError};
 
 // Number of times a submitter task will retry submission in quick succession
@@ -45,9 +48,9 @@ struct BatchEnvelope<T: TrackingId> {
 // Box must be borrowed to maintain proper ownership and lifetimes
 #[allow(clippy::borrowed_box)]
 impl<T: TrackingId> BatchEnvelope<T> {
-    fn create(
+    fn create<A: Addresser + Send>(
         batch_submission: BatchSubmission<T>,
-        addresser: &Box<dyn Addresser + Send>,
+        addresser: &A,
     ) -> Result<Self, InternalError> {
         let address = addresser.address(batch_submission.service_id)?;
         Ok(Self {
@@ -243,52 +246,134 @@ impl TaskHandler {
 /// Because this implementation is async, batches may not be submitted in the
 /// exact order in which they are received. Controlling the order and pace at
 /// which batches are submitted should be done by the queue component.
-pub struct BatchSubmitter {
-    runtime_handle: thread::JoinHandle<()>,
-    leader_handle: thread::JoinHandle<()>,
-    leader_tx: std::sync::mpsc::Sender<TerminateMessage>,
-    listener_handle: thread::JoinHandle<()>,
-    listener_tx: std::sync::mpsc::Sender<TerminateMessage>,
+
+pub struct BatchAddresser;
+
+pub struct BatchSubmitterBuilder<
+    T: 'static + TrackingId,
+    A: 'static + Addresser + Send,
+    Q: 'static + Iterator<Item = BatchSubmission<T>> + Send,
+    O: 'static + SubmitterObserver<T> + Send,
+> {
+    addresser: Option<A>,
+    queue: Option<Q>,
+    observer: Option<O>,
 }
 
-impl Submitter<'_> for BatchSubmitter {
-    /// Initialize the submission service.
-    ///
-    /// Note that the submitter consumes the addresser, queuer, and observer.
-    /// These are each moved to separate threads within the submitter.
-    fn start<'a, T: 'static + TrackingId>(
-        addresser: Box<dyn Addresser + Send>,
-        mut queue: Box<dyn Iterator<Item = BatchSubmission<T>> + Send>,
-        observer: Box<dyn SubmitterObserver<T> + Send>,
-    ) -> Result<Box<Self>, InternalError> {
+impl<
+        T: TrackingId,
+        A: Addresser + Send,
+        Q: Iterator<Item = BatchSubmission<T>> + Send,
+        O: SubmitterObserver<T> + Send,
+    > SubmitterBuilder<T, A, Q, O> for BatchSubmitterBuilder<T, A, Q, O>
+{
+    type RunnableSubmitter = BatchRunnableSubmitter<T, A, Q, O>;
+
+    fn new() -> Self {
+        Self {
+            addresser: None,
+            queue: None,
+            observer: None,
+        }
+    }
+
+    fn with_addresser(&mut self, addresser: A) {
+        self.addresser = Some(addresser);
+    }
+
+    fn with_queue(&mut self, queue: Q) {
+        self.queue = Some(queue);
+    }
+
+    fn with_observer(&mut self, observer: O) {
+        self.observer = Some(observer);
+    }
+
+    // Should maybe break out the error cases
+    fn build(self) -> Result<Self::RunnableSubmitter, InternalError> {
+        match (self.addresser, self.queue, self.observer) {
+            (Some(a), Some(q), Some(o)) => Ok(BatchRunnableSubmitter {
+                addresser: a,
+                queue: q,
+                observer: o,
+                leader_channel: std::sync::mpsc::channel(),
+                listener_channel: std::sync::mpsc::channel(),
+                submission_channel: std::sync::mpsc::channel(),
+                spawner_channel: tokio::sync::mpsc::channel(64),
+                runtime: Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name("submitter_async_runtime")
+                    .build()
+                    .map_err(|e| InternalError::with_message(format!("{:?}", e)))?,
+            }),
+            _ => Err(InternalError::with_message(
+                "Error building runnable submitter WSI: missing required field".to_string(),
+            )),
+        }
+    }
+}
+
+pub struct BatchRunnableSubmitter<
+    T: TrackingId,
+    A: Addresser + Send,
+    Q: Iterator<Item = BatchSubmission<T>> + Send,
+    O: SubmitterObserver<T> + Send,
+> {
+    addresser: A,
+    queue: Q,
+    observer: O,
+    leader_channel: (
+        std::sync::mpsc::Sender<TerminateMessage>,
+        std::sync::mpsc::Receiver<TerminateMessage>,
+    ),
+    listener_channel: (
+        std::sync::mpsc::Sender<TerminateMessage>,
+        std::sync::mpsc::Receiver<TerminateMessage>,
+    ),
+    submission_channel: (
+        std::sync::mpsc::Sender<BatchMessage<T>>,
+        std::sync::mpsc::Receiver<BatchMessage<T>>,
+    ),
+    spawner_channel: (
+        tokio::sync::mpsc::Sender<CentralMessage<T>>,
+        tokio::sync::mpsc::Receiver<CentralMessage<T>>,
+    ),
+    runtime: tokio::runtime::Runtime,
+}
+
+impl<
+        T: 'static + TrackingId,
+        A: 'static + Addresser + Send,
+        Q: 'static + Iterator<Item = BatchSubmission<T>> + Send,
+        O: 'static + SubmitterObserver<T> + Send,
+    > RunnableSubmitter<T, A, Q, O> for BatchRunnableSubmitter<T, A, Q, O>
+{
+    type RunningSubmitter = BatchRunningSubmitter;
+
+    fn run(self) -> Result<Self::RunningSubmitter, InternalError> {
+        let addresser = self.addresser;
+        let mut queue = self.queue;
+        let observer = self.observer;
+
         // Create channels for termination messages
-        let (leader_tx, leader_rx) = std::sync::mpsc::channel();
-        let (listener_tx, listener_rx) = std::sync::mpsc::channel();
+        let (leader_tx, leader_rx) = self.leader_channel;
+        let (listener_tx, listener_rx) = self.listener_channel;
 
         // Channel for messages from the async tasks to the sync listener thread
-        let (tx_submission, rx_submission): (
-            std::sync::mpsc::Sender<BatchMessage<T>>,
-            std::sync::mpsc::Receiver<BatchMessage<T>>,
-        ) = std::sync::mpsc::channel();
+        let (tx_submission, rx_submission) = self.submission_channel;
         // Clone the sender so that the leader thread can notify the listener thread that it will
         // start submitting a batch
         let tx_leader = tx_submission.clone();
 
         // Channel for messges from the leader thread to the task-spawning thread
-        let (tx_spawner, mut rx_spawner) = mpsc::channel(64);
+        let (tx_spawner, mut rx_spawner) = self.spawner_channel;
 
-        // Create the runtime here to better catch errors on building
-        let rt = Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("submitter_async_runtime")
-            .build()
-            .map_err(|e| InternalError::with_message(format!("{:?}", e)))?;
-
+        let runtime = self.runtime;
         // Move the asnyc runtime to a separate thread so it doesn't block this one
         let runtime_handle = std::thread::Builder::new()
             .name("submitter_async_runtime_host".to_string())
             .spawn(move || {
-                rt.block_on(async move {
+                runtime.block_on(async move {
                     while let Some(msg) = rx_spawner.recv().await {
                         match msg {
                             CentralMessage::NewTask(t) => {
@@ -380,16 +465,26 @@ impl Submitter<'_> for BatchSubmitter {
             })
             .map_err(|e| InternalError::with_message(format!("{:?}", e)))?;
 
-        Ok(Box::new(Self {
+        Ok(BatchRunningSubmitter {
             runtime_handle,
             leader_handle,
             leader_tx,
             listener_handle,
             listener_tx,
-        }))
+        })
     }
+}
 
-    fn shutdown(self) -> Result<(), InternalError> {
+pub struct BatchRunningSubmitter {
+    runtime_handle: thread::JoinHandle<()>,
+    leader_handle: thread::JoinHandle<()>,
+    leader_tx: std::sync::mpsc::Sender<TerminateMessage>,
+    listener_handle: thread::JoinHandle<()>,
+    listener_tx: std::sync::mpsc::Sender<TerminateMessage>,
+}
+
+impl RunningSubmitter for BatchRunningSubmitter {
+    fn signal_shutdown(&self) -> Result<(), InternalError> {
         self.leader_tx
             .send(TerminateMessage::Terminate)
             .map_err(|e| {
@@ -406,6 +501,11 @@ impl Submitter<'_> for BatchSubmitter {
                     e
                 ))
             })?;
+        Ok(())
+    }
+
+    /// Wind down and stop the submission service.
+    fn shutdown(self) -> Result<(), InternalError> {
         self.leader_handle
             .join()
             .map_err(|e| InternalError::with_message(format!("{:?}", e)))?;
@@ -419,6 +519,7 @@ impl Submitter<'_> for BatchSubmitter {
     }
 }
 
+/*
 #[cfg(test)]
 mod tests {
 
@@ -843,4 +944,4 @@ mod tests {
         assert_eq!(first_response, first_expected_response);
         assert_eq!(second_response, second_expected_response);
     }
-}
+}*/

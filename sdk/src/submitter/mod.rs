@@ -25,7 +25,7 @@ pub mod observer;
 /// If the DLT takes a parameter like `service_id`, `routing` will be the
 /// `service_id` associated with that batch. If the DLT does not take a
 /// parameter, `routing` will always be `None`.
-pub trait Addresser {
+pub trait Addresser: Send {
     /// Generate an address (i.e. URL) to which the batch will be sent.
     fn address(&self, routing: Option<String>) -> Result<String, InternalError>;
 }
@@ -37,18 +37,40 @@ pub trait SubmitterObserver<T: TrackingId> {
     fn notify(&self, id: T, status: Option<u16>, message: Option<String>);
 }
 
-/// An interface to a submission service
-///
-/// This interface acts as a handle to the submission service. Note that the
-/// submitter consumes the addesser, queue, and observer.
-pub trait Submitter<'a> {
-    /// Start the submission service. Return any error that occurs while
-    /// initializing its implementation.
-    fn start<T: 'static + TrackingId>(
-        addresser: Box<dyn Addresser + Send>,
-        queue: Box<dyn Iterator<Item = BatchSubmission<T>> + Send>,
-        observer: Box<dyn SubmitterObserver<T> + Send>,
-    ) -> Result<Box<Self>, InternalError>;
+pub trait SubmitterBuilder<
+    T: 'static + TrackingId,
+    A: Addresser + Send,
+    Q: Iterator<Item = BatchSubmission<T>> + Send,
+    O: SubmitterObserver<T> + Send,
+>
+{
+    type RunnableSubmitter: RunnableSubmitter<T, A, Q, O>;
+
+    fn new() -> Self;
+
+    fn with_addresser(&mut self, addresser: A);
+
+    fn with_queue(&mut self, queue: Q);
+
+    fn with_observer(&mut self, observer: O);
+
+    fn build(self) -> Result<Self::RunnableSubmitter, InternalError>;
+}
+
+pub trait RunnableSubmitter<
+    T: 'static + TrackingId,
+    A: Addresser + Send,
+    Q: Iterator<Item = BatchSubmission<T>> + Send,
+    O: SubmitterObserver<T> + Send,
+>
+{
+    type RunningSubmitter: RunningSubmitter;
+
+    fn run(self) -> Result<Self::RunningSubmitter, InternalError>;
+}
+
+pub trait RunningSubmitter {
+    fn signal_shutdown(&self) -> Result<(), InternalError>;
 
     /// Wind down and stop the submission service.
     fn shutdown(self) -> Result<(), InternalError>;
