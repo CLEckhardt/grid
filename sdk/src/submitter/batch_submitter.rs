@@ -24,8 +24,8 @@ use log::{error, info};
 use tokio::runtime::Builder;
 
 use super::{
-    Addresser, BatchSubmission, RunnableSubmitter, RunningSubmitter, SubmitterBuilder,
-    SubmitterObserver, TrackingId,
+    Addresser, /*BatchSubmission,*/ RunnableSubmitter, RunningSubmitter, SubmitterBuilder,
+    SubmitterObserver, TrackingId, VerifiedBatch,
 };
 use crate::error::{ClientError, InternalError};
 
@@ -44,12 +44,12 @@ struct BatchEnvelope<T: TrackingId> {
     address: String,
     payload: Vec<u8>,
 }
-
+/*
 // Box must be borrowed to maintain proper ownership and lifetimes
 #[allow(clippy::borrowed_box)]
-impl<T: TrackingId> BatchEnvelope<T> {
-    fn create<A: Addresser + Send>(
-        batch_submission: BatchSubmission<T>,
+impl<T: TrackingId, S> BatchEnvelope<T> {
+    fn create<A: Addresser<T> + Send>(
+        batch_submission: dyn BatchSubmission<Submission = S>,
         addresser: &A,
     ) -> Result<Self, InternalError> {
         let address = addresser.address(batch_submission.service_id)?;
@@ -57,6 +57,22 @@ impl<T: TrackingId> BatchEnvelope<T> {
             id: batch_submission.id,
             address,
             payload: batch_submission.serialized_batch,
+        })
+    }
+}
+*/
+// Box must be borrowed to maintain proper ownership and lifetimes
+#[allow(clippy::borrowed_box)]
+impl<T: TrackingId> BatchEnvelope<T> {
+    fn create<B: VerifiedBatch, A: Addresser<Batch = B> + Send>(
+        batch: B,
+        addresser: &A,
+    ) -> Result<Self, InternalError> {
+        let address = addresser.address(&batch);
+        Ok(Self {
+            id: batch.batch_header().to_string(),
+            address,
+            payload: batch.serialized_batch(),
         })
     }
 }
@@ -251,20 +267,27 @@ pub struct BatchAddresser;
 
 pub struct BatchSubmitterBuilder<
     T: 'static + TrackingId,
-    A: 'static + Addresser + Send,
-    Q: 'static + Iterator<Item = BatchSubmission<T>> + Send,
-    O: 'static + SubmitterObserver<T> + Send,
+    //B: 'static + VerifiedBatch,
+    //A: 'static + Addresser<B> + Send,
+    A: 'static + Addresser<Batch = dyn VerifiedBatch> + Send,
+    //Q: 'static + Iterator<Item = dyn BatchSubmission<Submission = S>> + Send,
+    Q: 'static + Iterator<Item = dyn VerifiedBatch> + Send,
+    O: 'static + SubmitterObserver + Send,
 > {
     addresser: Option<A>,
     queue: Option<Q>,
     observer: Option<O>,
+    _marker: std::marker::PhantomData<T>,
 }
 
 impl<
         T: TrackingId,
-        A: Addresser + Send,
-        Q: Iterator<Item = BatchSubmission<T>> + Send,
-        O: SubmitterObserver<T> + Send,
+        //B: VerifiedBatch,
+        //A: Addresser<B> + Send,
+        A: 'static + Addresser<Batch = dyn VerifiedBatch> + Send,
+        //Q: Iterator<Item = dyn BatchSubmission<Submission = S>> + Send,
+        Q: 'static + Iterator<Item = dyn VerifiedBatch> + Send,
+        O: SubmitterObserver<Id = T> + Send,
     > SubmitterBuilder<T, A, Q, O> for BatchSubmitterBuilder<T, A, Q, O>
 {
     type RunnableSubmitter = BatchRunnableSubmitter<T, A, Q, O>;
@@ -274,6 +297,7 @@ impl<
             addresser: None,
             queue: None,
             observer: None,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -293,9 +317,9 @@ impl<
     fn build(self) -> Result<Self::RunnableSubmitter, InternalError> {
         match (self.addresser, self.queue, self.observer) {
             (Some(a), Some(q), Some(o)) => Ok(BatchRunnableSubmitter {
-                addresser: a,
-                queue: q,
-                observer: o,
+                addresser: Box::new(a),
+                queue: Box::new(q),
+                observer: Box::new(o),
                 leader_channel: std::sync::mpsc::channel(),
                 listener_channel: std::sync::mpsc::channel(),
                 submission_channel: std::sync::mpsc::channel(),
@@ -315,13 +339,16 @@ impl<
 
 pub struct BatchRunnableSubmitter<
     T: TrackingId,
-    A: Addresser + Send,
-    Q: Iterator<Item = BatchSubmission<T>> + Send,
-    O: SubmitterObserver<T> + Send,
+    //B: VerifiedBatch,
+    //A: Addresser<B> + Send,
+    A: 'static + Addresser<Batch = dyn VerifiedBatch> + Send,
+    //Q: Iterator<Item = dyn BatchSubmission<Submission = S>> + Send,
+    Q: 'static + Iterator<Item = dyn VerifiedBatch> + Send,
+    O: SubmitterObserver + Send,
 > {
-    addresser: A,
-    queue: Q,
-    observer: O,
+    addresser: Box<A>,
+    queue: Box<Q>,
+    observer: Box<O>,
     leader_channel: (
         std::sync::mpsc::Sender<TerminateMessage>,
         std::sync::mpsc::Receiver<TerminateMessage>,
@@ -343,9 +370,12 @@ pub struct BatchRunnableSubmitter<
 
 impl<
         T: 'static + TrackingId,
-        A: 'static + Addresser + Send,
-        Q: 'static + Iterator<Item = BatchSubmission<T>> + Send,
-        O: 'static + SubmitterObserver<T> + Send,
+        //B: 'static + VerifiedBatch,
+        //A: 'static + Addresser<B> + Send,
+        A: 'static + Addresser<Batch = dyn VerifiedBatch> + Send,
+        //Q: 'static + Iterator<Item = dyn BatchSubmission<Submission = S>> + Send,
+        Q: 'static + Iterator<Item = dyn VerifiedBatch> + Send,
+        O: 'static + SubmitterObserver<Id = T> + Send,
     > RunnableSubmitter<T, A, Q, O> for BatchRunnableSubmitter<T, A, Q, O>
 {
     type RunningSubmitter = BatchRunningSubmitter;
