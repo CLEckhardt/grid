@@ -24,7 +24,7 @@ use log::{error, info};
 use tokio::runtime::Builder;
 
 use super::{
-    Addresser, BatchSubmission, RunnableSubmitter, RunningSubmitter, SubmitterBuilder,
+    batches::BatchEnvelope, RunnableSubmitter, RunningSubmitter, SubmitterBuilder,
     SubmitterObserver, TrackingId,
 };
 use crate::error::{ClientError, InternalError};
@@ -36,30 +36,6 @@ const POLLING_INTERVAL: u64 = 1000;
 
 //
 // OBJECTS THAT MOVE DATA THROUGH THE SUBMITTER
-
-#[derive(Debug, Clone, PartialEq)]
-// Wraps the batch as it moves through the submitter
-struct BatchEnvelope<T: TrackingId> {
-    id: T,
-    address: String,
-    payload: Vec<u8>,
-}
-
-// Box must be borrowed to maintain proper ownership and lifetimes
-#[allow(clippy::borrowed_box)]
-impl<T: TrackingId> BatchEnvelope<T> {
-    fn create<A: Addresser + Send>(
-        batch_submission: BatchSubmission<T>,
-        addresser: &A,
-    ) -> Result<Self, InternalError> {
-        let address = addresser.address(batch_submission.service_id)?;
-        Ok(Self {
-            id: batch_submission.id,
-            address,
-            payload: batch_submission.serialized_batch,
-        })
-    }
-}
 
 #[derive(Debug, PartialEq)]
 // Carries the submission response from the http client back through the submitter to the observer
@@ -155,13 +131,13 @@ impl<T: TrackingId> SubmissionCommand<T> {
         self.attempts += 1;
 
         let res = client
-            .post(self.batch_envelope.address.clone())
-            .body(self.batch_envelope.payload.clone())
+            .post(self.batch_envelope.address().clone())
+            .body(self.batch_envelope.serialized_batch().clone())
             .send()
             .await?;
 
         Ok(SubmissionResponse::new(
-            self.batch_envelope.id.clone(),
+            self.batch_envelope.batch_id().clone(),
             res.status().as_u16(),
             res.text().await?,
             self.attempts,
@@ -219,7 +195,7 @@ struct TaskHandler;
 
 impl TaskHandler {
     async fn spawn<T: TrackingId>(task: NewTask<T>) {
-        let id = task.batch_envelope.id.clone();
+        let id = task.batch_envelope.batch_id().clone();
         let submission: Result<SubmissionResponse<T>, ClientError> =
             SubmissionController::new(task.batch_envelope).run().await;
 
@@ -247,38 +223,28 @@ impl TaskHandler {
 /// exact order in which they are received. Controlling the order and pace at
 /// which batches are submitted should be done by the queue component.
 
-pub struct BatchAddresser;
-
 pub struct BatchSubmitterBuilder<
     T: 'static + TrackingId,
-    A: 'static + Addresser + Send,
-    Q: 'static + Iterator<Item = BatchSubmission<T>> + Send,
+    Q: 'static + Iterator<Item = BatchEnvelope<T>> + Send,
     O: 'static + SubmitterObserver<T> + Send,
 > {
-    addresser: Option<A>,
     queue: Option<Q>,
     observer: Option<O>,
 }
 
 impl<
         T: TrackingId,
-        A: Addresser + Send,
-        Q: Iterator<Item = BatchSubmission<T>> + Send,
+        Q: Iterator<Item = BatchEnvelope<T>> + Send,
         O: SubmitterObserver<T> + Send,
-    > SubmitterBuilder<T, A, Q, O> for BatchSubmitterBuilder<T, A, Q, O>
+    > SubmitterBuilder<T, Q, O> for BatchSubmitterBuilder<T, Q, O>
 {
-    type RunnableSubmitter = BatchRunnableSubmitter<T, A, Q, O>;
+    type RunnableSubmitter = BatchRunnableSubmitter<T, Q, O>;
 
     fn new() -> Self {
         Self {
-            addresser: None,
             queue: None,
             observer: None,
         }
-    }
-
-    fn with_addresser(&mut self, addresser: A) {
-        self.addresser = Some(addresser);
     }
 
     fn with_queue(&mut self, queue: Q) {
@@ -291,9 +257,8 @@ impl<
 
     // Should maybe break out the error cases
     fn build(self) -> Result<Self::RunnableSubmitter, InternalError> {
-        match (self.addresser, self.queue, self.observer) {
-            (Some(a), Some(q), Some(o)) => Ok(BatchRunnableSubmitter {
-                addresser: a,
+        match (self.queue, self.observer) {
+            (Some(q), Some(o)) => Ok(BatchRunnableSubmitter {
                 queue: q,
                 observer: o,
                 leader_channel: std::sync::mpsc::channel(),
@@ -315,11 +280,9 @@ impl<
 
 pub struct BatchRunnableSubmitter<
     T: TrackingId,
-    A: Addresser + Send,
-    Q: Iterator<Item = BatchSubmission<T>> + Send,
+    Q: Iterator<Item = BatchEnvelope<T>> + Send,
     O: SubmitterObserver<T> + Send,
 > {
-    addresser: A,
     queue: Q,
     observer: O,
     leader_channel: (
@@ -343,15 +306,13 @@ pub struct BatchRunnableSubmitter<
 
 impl<
         T: 'static + TrackingId,
-        A: 'static + Addresser + Send,
-        Q: 'static + Iterator<Item = BatchSubmission<T>> + Send,
+        Q: 'static + Iterator<Item = BatchEnvelope<T>> + Send,
         O: 'static + SubmitterObserver<T> + Send,
-    > RunnableSubmitter<T, A, Q, O> for BatchRunnableSubmitter<T, A, Q, O>
+    > RunnableSubmitter<T, Q, O> for BatchRunnableSubmitter<T, Q, O>
 {
     type RunningSubmitter = BatchRunningSubmitter;
 
     fn run(self) -> Result<Self::RunningSubmitter, InternalError> {
-        let addresser = self.addresser;
         let mut queue = self.queue;
         let observer = self.observer;
 
@@ -405,22 +366,19 @@ impl<
                     }
                     // Poll for next batch and submit it
                     match queue.next() {
-                        Some(next_batch) => match BatchEnvelope::create(next_batch, &addresser) {
-                            Ok(b) => {
-                                info!("Batch {}: received from queue", &b.id);
-                                if let Err(e) = tx_leader
-                                    .send(BatchMessage::SubmissionNotification(b.id.clone()))
-                                {
-                                    error!("Error sending submission notification message: {:?}", e)
-                                }
-                                if let Err(e) = tx_spawner.blocking_send(CentralMessage::NewTask(
-                                    NewTask::new(tx_submission.clone(), b),
-                                )) {
-                                    error!("Error sending NewTask message: {:?}", e)
-                                };
+                        Some(b) => {
+                            info!("Batch {}: received from queue", &b.batch_id());
+                            if let Err(e) = tx_leader
+                                .send(BatchMessage::SubmissionNotification(b.batch_id().clone()))
+                            {
+                                error!("Error sending submission notification message: {:?}", e)
                             }
-                            Err(e) => error!("Error creating batch envelope: {:?}", e),
-                        },
+                            if let Err(e) = tx_spawner.blocking_send(CentralMessage::NewTask(
+                                NewTask::new(tx_submission.clone(), b),
+                            )) {
+                                error!("Error sending NewTask message: {:?}", e)
+                            };
+                        }
                         None => std::thread::sleep(time::Duration::from_millis(POLLING_INTERVAL)),
                     }
                 }

@@ -25,7 +25,7 @@ mod error;
 
 pub use error::{BatchBuilderError, BatchTrackingStoreError};
 
-const NON_SPLINTER_SERVICE_ID_DEFAULT: &str = "----";
+pub const NON_SPLINTER_SERVICE_ID_DEFAULT: &str = "----";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum BatchStatus {

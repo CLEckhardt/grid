@@ -20,60 +20,57 @@
 //! which batches can be submitted and the url parameter it accepts, if
 //! applicable.
 
-use super::Addresser;
-use crate::error::InternalError;
+use super::{
+    batches::{TrackingBatchNoSID, TrackingBatchWithSID},
+    Addresser,
+};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct BatchAddresser {
+pub struct BatchAddresserWithSID {
     base_url: &'static str,
-    parameter: Option<&'static str>,
 }
 
-impl BatchAddresser {
+impl BatchAddresserWithSID {
+    pub fn new(base_url: &'static str) -> Self {
+        Self { base_url }
+    }
+}
+
+impl Addresser for BatchAddresserWithSID {
+    type Batch = TrackingBatchWithSID;
+    fn address(&self, batch: &TrackingBatchWithSID) -> String {
+        format!(
+            "{base_url}?service_id={sid}",
+            base_url = self.base_url,
+            sid = batch.service_id()
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchAddresserNoSID {
+    base_url: &'static str,
+}
+
+impl BatchAddresserNoSID {
     /// Create a new addresser based on the requirements of the DLT. If the DLT
     /// does not take a URL parameter like `service-id`, the parameter is
     /// `None`.
-    pub fn new(base_url: &'static str, parameter: Option<&'static str>) -> Self {
-        Self {
-            base_url,
-            parameter,
-        }
+    pub fn new(base_url: &'static str) -> Self {
+        Self { base_url }
     }
 }
 
-impl Addresser for BatchAddresser {
+impl Addresser for BatchAddresserNoSID {
+    type Batch = TrackingBatchNoSID;
     /// Generate the URL to which the batch should be sent.
-    fn address(&self, routing: Option<String>) -> Result<String, InternalError> {
-        match &self.parameter {
-            Some(p) => {
-                if let Some(r) = routing {
-                    Ok(format!(
-                        "{base_url}?{parameter}={route}",
-                        base_url = self.base_url,
-                        parameter = p,
-                        route = r,
-                    ))
-                } else {
-                    Err(InternalError::with_message(
-                        "Addressing error: expecting service_id for batch but none was provided"
-                            .to_string(),
-                    ))
-                }
-            }
-            None => {
-                if routing.is_none() {
-                    Ok(self.base_url.to_string())
-                } else {
-                    Err(InternalError::with_message(
-                        "Addressing error: service_id for batch was provided but none was expected"
-                            .to_string(),
-                    ))
-                }
-            }
-        }
+    fn address(&self, batch: &TrackingBatchNoSID) -> String {
+        // Batch info isn't used when there is no service_id
+        let _ = batch;
+        self.base_url.to_string()
     }
 }
-
+/*
 #[cfg(test)]
 mod tests {
 
@@ -121,4 +118,4 @@ mod tests {
             .is_err());
         assert!(test_addresser_w_serv.address(None).is_err());
     }
-}
+}*/
