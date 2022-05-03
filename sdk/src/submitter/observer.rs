@@ -14,17 +14,24 @@
 
 //! Interprets messages from the submitter about batches and updates the store accordingly.
 
-use super::{SubmitterObserver, TrackingId};
+use super::{GlobalScopeId, ServiceScopeId, SubmitterObserver};
 use crate::batch_tracking::store::BatchTrackingStore;
 
 #[allow(dead_code)]
-pub struct BatchTrackingObserver {
+pub struct SubmitterObserverServiceScopeId {
     store: Box<dyn BatchTrackingStore>,
 }
 
 #[allow(unused_variables)]
-impl<T: TrackingId> SubmitterObserver<T> for BatchTrackingObserver {
-    fn notify(&self, id: T, status: Option<u16>, message: Option<String>) {
+impl SubmitterObserver for SubmitterObserverServiceScopeId {
+    type Id = ServiceScopeId;
+    fn notify(
+        &self,
+        batch_header: String,
+        scope_id: ServiceScopeId,
+        status: Option<u16>,
+        message: Option<String>,
+    ) {
         if let Some(s) = status {
             match &s {
                 0 => {
@@ -88,3 +95,47 @@ impl<T: TrackingId> SubmitterObserver<T> for BatchTrackingObserver {
 
 // A batch status of "Delayed" means that the queuer should retry these after a designated amount
 // of time
+
+#[allow(dead_code)]
+pub struct SubmitterObserverGlobalScopeId {
+    store: Box<dyn BatchTrackingStore>,
+}
+
+#[allow(unused_variables)]
+impl SubmitterObserver for SubmitterObserverGlobalScopeId {
+    type Id = GlobalScopeId;
+    fn notify(
+        &self,
+        batch_header: String,
+        scope_id: GlobalScopeId,
+        status: Option<u16>,
+        message: Option<String>,
+    ) {
+        if let Some(s) = status {
+            match &s {
+                0 => {
+                    unimplemented!()
+                }
+                200 => {
+                    unimplemented!()
+                }
+                503 => {
+                    unimplemented!()
+                }
+                404 => {
+                    unimplemented!()
+                }
+                500 => {
+                    unimplemented!()
+                }
+                _ => {
+                    unimplemented!()
+                }
+            }
+        } else {
+            // A missing status code represents an error in the submission process
+            // This error will have already been logged by the submitter
+            unimplemented!();
+        }
+    }
+}

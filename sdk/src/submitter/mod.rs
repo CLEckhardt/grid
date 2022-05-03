@@ -16,40 +16,72 @@
 
 use crate::error::InternalError;
 // Stuff is probably not in the right place
-use crate::submitter::batches::{BatchEnvelope, TrackingId, VerifiedBatch};
+use crate::submitter::batches::Submission;
 
 pub mod addresser;
 pub mod batch_submitter;
 pub mod batches;
 pub mod observer;
 
+//
+// Move this somewhere else
+//
+#[derive(Clone, Debug, PartialEq)]
+struct FullyQualifiedServiceId {}
+
+pub trait ScopeId: Clone + PartialEq + std::fmt::Debug + Sync + Send {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GlobalScopeId {}
+impl ScopeId for GlobalScopeId {}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ServiceScopeId {
+    service_id: FullyQualifiedServiceId,
+}
+impl ScopeId for ServiceScopeId {}
+
+//
+
+
+
 /// An interface for generating the address to which a batch will be sent
 ///
 /// If the DLT takes a parameter like `service_id`, `routing` will be the
 /// `service_id` associated with that batch. If the DLT does not take a
 /// parameter, `routing` will always be `None`.
-pub trait Addresser: Send {
-    type Batch: VerifiedBatch;
+pub trait UrlResolver: Sync + Send {
+    type Id: ScopeId;
     /// Generate an address (i.e. URL) to which the batch will be sent.
-    fn address(&self, batch: &Self::Batch) -> String;
+    fn url(&self, scope_id: &Self::Id) -> String;
 }
 
 /// An interface for interpretting and recording updates from the submitter
-pub trait SubmitterObserver<T: TrackingId> {
+pub trait SubmitterObserver {
+    type Id: ScopeId;
     /// Notify the observer of an update. The interpretation and recording
     /// of the update is determined by the observer's implementation.
-    fn notify(&self, id: T, status: Option<u16>, message: Option<String>);
+    fn notify(
+        &self,
+        batch_header: String,
+        scope_id: Self::Id,
+        status: Option<u16>,
+        message: Option<String>,
+    );
 }
 
 pub trait SubmitterBuilder<
-    T: 'static + TrackingId,
-    Q: Iterator<Item = BatchEnvelope<T>> + Send,
-    O: SubmitterObserver<T> + Send,
+    S: ScopeId,
+    R: UrlResolver<Id = S> + Sync + Send,
+    Q: Iterator<Item = Submission<S>> + Send,
+    O: SubmitterObserver<Id = S> + Send,
 >
 {
-    type RunnableSubmitter: RunnableSubmitter<T, Q, O>;
+    type RunnableSubmitter: RunnableSubmitter<S, R, Q, O>;
 
     fn new() -> Self;
+
+    fn with_url_resolver(&mut self, url_resolver: &'static R);
 
     fn with_queue(&mut self, queue: Q);
 
@@ -59,9 +91,10 @@ pub trait SubmitterBuilder<
 }
 
 pub trait RunnableSubmitter<
-    T: 'static + TrackingId,
-    Q: Iterator<Item = BatchEnvelope<T>> + Send,
-    O: SubmitterObserver<T> + Send,
+    S: ScopeId,
+    R: UrlResolver<Id = S> + Sync + Send,
+    Q: Iterator<Item = Submission<S>> + Send,
+    O: SubmitterObserver<Id = S> + Send,
 >
 {
     type RunningSubmitter: RunningSubmitter;

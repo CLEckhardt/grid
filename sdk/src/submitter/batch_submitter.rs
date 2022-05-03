@@ -24,8 +24,8 @@ use log::{error, info};
 use tokio::runtime::Builder;
 
 use super::{
-    batches::BatchEnvelope, RunnableSubmitter, RunningSubmitter, SubmitterBuilder,
-    SubmitterObserver, TrackingId,
+    batches::Submission, RunnableSubmitter, RunningSubmitter, ScopeId, SubmitterBuilder,
+    SubmitterObserver, UrlResolver,
 };
 use crate::error::{ClientError, InternalError};
 
@@ -39,17 +39,19 @@ const POLLING_INTERVAL: u64 = 1000;
 
 #[derive(Debug, PartialEq)]
 // Carries the submission response from the http client back through the submitter to the observer
-struct SubmissionResponse<T: TrackingId> {
-    id: T,
+struct SubmissionResponse<S: ScopeId> {
+    batch_header: String,
+    scope_id: S,
     status: u16,
     message: String,
     attempts: u16,
 }
 
-impl<T: TrackingId> SubmissionResponse<T> {
-    fn new(id: T, status: u16, message: String, attempts: u16) -> Self {
+impl<S: ScopeId> SubmissionResponse<S> {
+    fn new(batch_header: String, scope_id: S, status: u16, message: String, attempts: u16) -> Self {
         Self {
-            id,
+            batch_header,
+            scope_id,
             status,
             message,
             attempts,
@@ -59,16 +61,16 @@ impl<T: TrackingId> SubmissionResponse<T> {
 
 #[derive(Debug, PartialEq)]
 // A message about a batch; sent between threads
-enum BatchMessage<T: TrackingId> {
-    SubmissionNotification(T),
-    SubmissionResponse(SubmissionResponse<T>),
-    ErrorResponse(ErrorResponse<T>),
+enum BatchMessage<S: ScopeId> {
+    SubmissionNotification((String, S)),
+    SubmissionResponse(SubmissionResponse<S>),
+    ErrorResponse(ErrorResponse<S>),
 }
 
 #[derive(Debug)]
 // A message sent from the leader thread to the async runtime
-enum CentralMessage<T: TrackingId> {
-    NewTask(NewTask<T>),
+enum CentralMessage<S: ScopeId> {
+    NewTask(NewTask<S>),
     Terminate,
 }
 
@@ -81,27 +83,28 @@ enum TerminateMessage {
 // The object required for an async task to function
 // Provides the batch and a channel sender with which the task communicates back to the listener
 // thread about the batch
-struct NewTask<T: TrackingId> {
-    tx: std::sync::mpsc::Sender<BatchMessage<T>>,
-    batch_envelope: BatchEnvelope<T>,
+struct NewTask<S: ScopeId> {
+    tx: std::sync::mpsc::Sender<BatchMessage<S>>,
+    submission: Submission<S>,
 }
 
-impl<T: TrackingId> NewTask<T> {
-    fn new(tx: std::sync::mpsc::Sender<BatchMessage<T>>, batch_envelope: BatchEnvelope<T>) -> Self {
-        Self { tx, batch_envelope }
+impl<S: ScopeId> NewTask<S> {
+    fn new(tx: std::sync::mpsc::Sender<BatchMessage<S>>, submission: Submission<S>) -> Self {
+        Self { tx, submission }
     }
 }
 
-impl<T: TrackingId> fmt::Debug for NewTask<T> {
+impl<S: ScopeId> fmt::Debug for NewTask<S> {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(fmt, "{:?}", self.batch_envelope)
+        write!(fmt, "{:?}", self.submission)
     }
 }
 
 #[derive(Debug, PartialEq)]
 // Communicates an errror message from the task handler to the listener thread
-struct ErrorResponse<T: TrackingId> {
-    id: T,
+struct ErrorResponse<S: ScopeId> {
+    batch_header: String,
+    scope_id: S,
     error: String,
 }
 
@@ -110,20 +113,22 @@ struct ErrorResponse<T: TrackingId> {
 
 #[derive(Debug, PartialEq)]
 // Responsible for executing the submission request
-struct SubmissionCommand<T: TrackingId> {
-    batch_envelope: BatchEnvelope<T>,
+struct SubmissionCommand<'a, S: ScopeId, R: 'a + UrlResolver<Id = S>> {
+    url_resolver: &'a R,
+    submission: Submission<S>,
     attempts: u16,
 }
 
-impl<T: TrackingId> SubmissionCommand<T> {
-    fn new(batch_envelope: BatchEnvelope<T>) -> Self {
+impl<'a, S: ScopeId, R: 'a + UrlResolver<Id = S>> SubmissionCommand<'a, S, R> {
+    fn new(submission: Submission<S>, url_resolver: &'a R) -> Self {
         Self {
-            batch_envelope,
+            url_resolver,
+            submission,
             attempts: 0,
         }
     }
 
-    async fn execute(&mut self) -> Result<SubmissionResponse<T>, reqwest::Error> {
+    async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error> {
         let client = reqwest::Client::builder()
             .timeout(time::Duration::from_secs(15))
             .build()?;
@@ -131,13 +136,14 @@ impl<T: TrackingId> SubmissionCommand<T> {
         self.attempts += 1;
 
         let res = client
-            .post(self.batch_envelope.address().clone())
-            .body(self.batch_envelope.serialized_batch().clone())
+            .post(self.url_resolver.url(&self.submission.scope_id()))
+            .body(self.submission.serialized_batch().clone())
             .send()
             .await?;
 
         Ok(SubmissionResponse::new(
-            self.batch_envelope.batch_id().clone(),
+            self.submission.batch_header().clone(),
+            self.submission.scope_id().clone(),
             res.status().as_u16(),
             res.text().await?,
             self.attempts,
@@ -147,20 +153,20 @@ impl<T: TrackingId> SubmissionCommand<T> {
 
 #[derive(Debug, PartialEq)]
 // Responsible for controlling retry behavior
-struct SubmissionController<T: TrackingId> {
-    command: SubmissionCommand<T>,
+struct SubmissionController<'a, S: ScopeId, R: 'a + UrlResolver<Id = S>> {
+    command: SubmissionCommand<'a, S, R>,
 }
 
-impl<T: TrackingId> SubmissionController<T> {
-    fn new(batch_envelope: BatchEnvelope<T>) -> Self {
+impl<'a, S: ScopeId, R: 'a + UrlResolver<Id = S>> SubmissionController<'a, S, R> {
+    fn new(submission: Submission<S>, url_resolver: &'a R) -> Self {
         Self {
-            command: SubmissionCommand::new(batch_envelope),
+            command: SubmissionCommand::new(submission, url_resolver),
         }
     }
 
-    async fn run(&mut self) -> Result<SubmissionResponse<T>, ClientError> {
+    async fn run(&mut self) -> Result<SubmissionResponse<S>, ClientError> {
         let mut wait: u64 = 250;
-        let mut response: Result<SubmissionResponse<T>, reqwest::Error> =
+        let mut response: Result<SubmissionResponse<S>, reqwest::Error> =
             self.command.execute().await;
         for _ in 1..RETRY_ATTEMPTS {
             match &response {
@@ -194,15 +200,22 @@ impl<T: TrackingId> SubmissionController<T> {
 struct TaskHandler;
 
 impl TaskHandler {
-    async fn spawn<T: TrackingId>(task: NewTask<T>) {
-        let id = task.batch_envelope.batch_id().clone();
-        let submission: Result<SubmissionResponse<T>, ClientError> =
-            SubmissionController::new(task.batch_envelope).run().await;
+    async fn spawn<'a, S: ScopeId, R: 'a + UrlResolver<Id = S>>(
+        task: NewTask<S>,
+        url_resolver: &'a R,
+    ) {
+        let batch_header = task.submission.batch_header().clone();
+        let scope_id = task.submission.scope_id().clone();
+        let submission: Result<SubmissionResponse<S>, ClientError> =
+            SubmissionController::new(task.submission, url_resolver)
+                .run()
+                .await;
 
         let task_message = match submission {
             Ok(s) => BatchMessage::SubmissionResponse(s),
             Err(e) => BatchMessage::ErrorResponse(ErrorResponse {
-                id,
+                batch_header,
+                scope_id,
                 error: e.to_string(),
             }),
         };
@@ -210,41 +223,36 @@ impl TaskHandler {
     }
 }
 
-/// The submission service.
-///
-/// The `BatchSubmitter` struct acts as a handle of sorts for the submission
-/// service.
-///
-/// This implementation utilizes at least three additional threads, besides the
-/// one on which it is initialized. It uses a tokio async runtime, which will
-/// use more threads if they are available.
-///
-/// Because this implementation is async, batches may not be submitted in the
-/// exact order in which they are received. Controlling the order and pace at
-/// which batches are submitted should be done by the queue component.
-
 pub struct BatchSubmitterBuilder<
-    T: 'static + TrackingId,
-    Q: 'static + Iterator<Item = BatchEnvelope<T>> + Send,
-    O: 'static + SubmitterObserver<T> + Send,
+    S: 'static + ScopeId,
+    R: 'static + UrlResolver<Id = S> + Sync + Send,
+    Q: 'static + Iterator<Item = Submission<S>> + Send,
+    O: 'static + SubmitterObserver<Id = S> + Send,
 > {
+    url_resolver: Option<&'static R>,
     queue: Option<Q>,
     observer: Option<O>,
 }
 
 impl<
-        T: TrackingId,
-        Q: Iterator<Item = BatchEnvelope<T>> + Send,
-        O: SubmitterObserver<T> + Send,
-    > SubmitterBuilder<T, Q, O> for BatchSubmitterBuilder<T, Q, O>
+        S: ScopeId,
+        R: UrlResolver<Id = S> + Sync + Send,
+        Q: Iterator<Item = Submission<S>> + Send,
+        O: SubmitterObserver<Id = S> + Send,
+    > SubmitterBuilder<S, R, Q, O> for BatchSubmitterBuilder<S, R, Q, O>
 {
-    type RunnableSubmitter = BatchRunnableSubmitter<T, Q, O>;
+    type RunnableSubmitter = BatchRunnableSubmitter<S, R, Q, O>;
 
     fn new() -> Self {
         Self {
+            url_resolver: None,
             queue: None,
             observer: None,
         }
+    }
+
+    fn with_url_resolver(&mut self, url_resolver: &'static R) {
+        self.url_resolver = Some(url_resolver);
     }
 
     fn with_queue(&mut self, queue: Q) {
@@ -257,8 +265,9 @@ impl<
 
     // Should maybe break out the error cases
     fn build(self) -> Result<Self::RunnableSubmitter, InternalError> {
-        match (self.queue, self.observer) {
-            (Some(q), Some(o)) => Ok(BatchRunnableSubmitter {
+        match (self.url_resolver, self.queue, self.observer) {
+            (Some(r), Some(q), Some(o)) => Ok(BatchRunnableSubmitter {
+                url_resolver: r,
                 queue: q,
                 observer: o,
                 leader_channel: std::sync::mpsc::channel(),
@@ -279,10 +288,12 @@ impl<
 }
 
 pub struct BatchRunnableSubmitter<
-    T: TrackingId,
-    Q: Iterator<Item = BatchEnvelope<T>> + Send,
-    O: SubmitterObserver<T> + Send,
+    S: ScopeId,
+    R: 'static + UrlResolver<Id = S> + Sync + Send,
+    Q: Iterator<Item = Submission<S>> + Send,
+    O: SubmitterObserver<Id = S> + Send,
 > {
+    url_resolver: &'static R,
     queue: Q,
     observer: O,
     leader_channel: (
@@ -294,27 +305,30 @@ pub struct BatchRunnableSubmitter<
         std::sync::mpsc::Receiver<TerminateMessage>,
     ),
     submission_channel: (
-        std::sync::mpsc::Sender<BatchMessage<T>>,
-        std::sync::mpsc::Receiver<BatchMessage<T>>,
+        std::sync::mpsc::Sender<BatchMessage<S>>,
+        std::sync::mpsc::Receiver<BatchMessage<S>>,
     ),
     spawner_channel: (
-        tokio::sync::mpsc::Sender<CentralMessage<T>>,
-        tokio::sync::mpsc::Receiver<CentralMessage<T>>,
+        tokio::sync::mpsc::Sender<CentralMessage<S>>,
+        tokio::sync::mpsc::Receiver<CentralMessage<S>>,
     ),
     runtime: tokio::runtime::Runtime,
 }
 
 impl<
-        T: 'static + TrackingId,
-        Q: 'static + Iterator<Item = BatchEnvelope<T>> + Send,
-        O: 'static + SubmitterObserver<T> + Send,
-    > RunnableSubmitter<T, Q, O> for BatchRunnableSubmitter<T, Q, O>
+        S: 'static + ScopeId,
+        R: 'static + UrlResolver<Id = S> + Sync + Send,
+        Q: 'static + Iterator<Item = Submission<S>> + Send,
+        O: 'static + SubmitterObserver<Id = S> + Send,
+    > RunnableSubmitter<S, R, Q, O> for BatchRunnableSubmitter<S, R, Q, O>
 {
     type RunningSubmitter = BatchRunningSubmitter;
 
     fn run(self) -> Result<Self::RunningSubmitter, InternalError> {
+        // Move subcomponents out of self
         let mut queue = self.queue;
         let observer = self.observer;
+        let url_resolver = self.url_resolver;
 
         // Create channels for termination messages
         let (leader_tx, leader_rx) = self.leader_channel;
@@ -338,7 +352,7 @@ impl<
                     while let Some(msg) = rx_spawner.recv().await {
                         match msg {
                             CentralMessage::NewTask(t) => {
-                                tokio::spawn(TaskHandler::spawn(t));
+                                tokio::spawn(TaskHandler::spawn(t, url_resolver));
                             }
                             CentralMessage::Terminate => break,
                         }
@@ -367,10 +381,11 @@ impl<
                     // Poll for next batch and submit it
                     match queue.next() {
                         Some(b) => {
-                            info!("Batch {}: received from queue", &b.batch_id());
-                            if let Err(e) = tx_leader
-                                .send(BatchMessage::SubmissionNotification(b.batch_id().clone()))
-                            {
+                            info!("Batch {}: received from queue", &b.batch_header());
+                            if let Err(e) = tx_leader.send(BatchMessage::SubmissionNotification((
+                                b.batch_header().clone(),
+                                b.scope_id().clone(),
+                            ))) {
                                 error!("Error sending submission notification message: {:?}", e)
                             }
                             if let Err(e) = tx_spawner.blocking_send(CentralMessage::NewTask(
@@ -399,23 +414,36 @@ impl<
                     // Check for submisison response
                     if let Ok(msg) = rx_submission.try_recv() {
                         match msg {
-                            BatchMessage::SubmissionNotification(id) => {
+                            BatchMessage::SubmissionNotification((batch_header, scope_id)) => {
                                 // 0 signifies pre-submission
-                                observer.notify(id, Some(0), None)
+                                observer.notify(batch_header, scope_id, Some(0), None)
                             }
                             BatchMessage::SubmissionResponse(s) => {
                                 info!(
                                     "Batch {id}: received submission response [{code}] after \
                                     {attempts} attempt(s)",
-                                    id = &s.id,
+                                    id = &s.batch_header,
                                     code = &s.status,
                                     attempts = &s.attempts
                                 );
-                                observer.notify(s.id, Some(s.status), Some(s.message))
+                                observer.notify(
+                                    s.batch_header,
+                                    s.scope_id,
+                                    Some(s.status),
+                                    Some(s.message),
+                                )
                             }
                             BatchMessage::ErrorResponse(e) => {
-                                error!("Submission error for batch {}: {:?}", &e.id, &e.error);
-                                observer.notify(e.id, None, Some(e.error.to_string()));
+                                error!(
+                                    "Submission error for batch {}: {:?}",
+                                    &e.batch_header, &e.error
+                                );
+                                observer.notify(
+                                    e.batch_header,
+                                    e.scope_id,
+                                    None,
+                                    Some(e.error.to_string()),
+                                );
                             }
                         }
                     }

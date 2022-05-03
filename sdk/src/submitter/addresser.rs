@@ -20,53 +20,49 @@
 //! which batches can be submitted and the url parameter it accepts, if
 //! applicable.
 
-use super::{
-    batches::{TrackingBatchNoSID, TrackingBatchWithSID},
-    Addresser,
-};
+use super::{GlobalScopeId, ServiceScopeId, UrlResolver};
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct BatchAddresserWithSID {
-    base_url: &'static str,
+pub struct ServiceUrlResolver {
+    base_url: String,
 }
 
-impl BatchAddresserWithSID {
-    pub fn new(base_url: &'static str) -> Self {
+impl ServiceUrlResolver {
+    pub fn new(base_url: String) -> Self {
         Self { base_url }
     }
 }
 
-impl Addresser for BatchAddresserWithSID {
-    type Batch = TrackingBatchWithSID;
-    fn address(&self, batch: &TrackingBatchWithSID) -> String {
+impl UrlResolver for ServiceUrlResolver {
+    type Id = ServiceScopeId;
+    fn url(&self, scope_id: &ServiceScopeId) -> String {
+        /*
         format!(
             "{base_url}?service_id={sid}",
             base_url = self.base_url,
-            sid = batch.service_id()
-        )
+            // TODO: This is wrong
+            sid = scope_id.service_id().to_string()
+        )*/
+        unimplemented!()
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct BatchAddresserNoSID {
-    base_url: &'static str,
+pub struct GlobalUrlResolver {
+    base_url: String,
 }
 
-impl BatchAddresserNoSID {
-    /// Create a new addresser based on the requirements of the DLT. If the DLT
-    /// does not take a URL parameter like `service-id`, the parameter is
-    /// `None`.
-    pub fn new(base_url: &'static str) -> Self {
+impl GlobalUrlResolver {
+    pub fn new(base_url: String) -> Self {
         Self { base_url }
     }
 }
 
-impl Addresser for BatchAddresserNoSID {
-    type Batch = TrackingBatchNoSID;
-    /// Generate the URL to which the batch should be sent.
-    fn address(&self, batch: &TrackingBatchNoSID) -> String {
+impl UrlResolver for GlobalUrlResolver {
+    type Id = GlobalScopeId;
+    fn url(&self, scope_id: &GlobalScopeId) -> String {
         // Batch info isn't used when there is no service_id
-        let _ = batch;
+        let _ = scope_id;
         self.base_url.to_string()
     }
 }
