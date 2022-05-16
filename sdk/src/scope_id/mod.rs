@@ -20,6 +20,8 @@
 //! partitioned by `service_id` - they must be submitted only to the `service_id` with which they
 //! are associated.
 
+use std::fmt::Debug;
+
 use crate::error::InvalidArgumentError;
 
 mod service;
@@ -30,7 +32,7 @@ pub trait ValidId {
 }
 
 /// The scope ID trait.
-pub trait ScopeId: ValidId + Clone + PartialEq + Sync + Send {
+pub trait ScopeId: ValidId + Clone + PartialEq + Debug + Sync + Send {
     // Require a collection of trait bounds for a valid scope id
 }
 
