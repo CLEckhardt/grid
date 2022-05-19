@@ -22,6 +22,9 @@ use crate::{
     scope_id::ScopeId,
 };
 
+#[cfg(test)]
+use crate::scope_id::GlobalScopeId;
+
 // Number of times a submitter task will retry submission in quick succession
 const RETRY_ATTEMPTS: u16 = 10;
 // Time the submitter will wait to repoll after receiving None, in milliseconds
@@ -151,27 +154,61 @@ impl<'a, S: ScopeId, R: 'a + UrlResolver<Id = S>> ExecuteCommand<S>
     }
 }
 
-#[derive(Debug, PartialEq)]
-// Responsible for controlling retry behavior
-/*struct SubmissionController<'a, S: ScopeId, R: 'a + UrlResolver<Id = S>> {
-    command: SubmissionCommand<'a, S, R>,
+#[cfg(test)]
+struct MockSubmissionCommand<S: ScopeId> {
+    submission: Submission<S>,
+    attempts: u16,
 }
 
-impl<'a, S: ScopeId, R: 'a + UrlResolver<Id = S>> SubmissionController<'a, S, R> {
-    fn new(submission: Submission<S>, url_resolver: &'a R) -> Self {
+#[cfg(test)]
+impl<S: ScopeId> MockSubmissionCommand<S> {
+    fn new<'a, R: 'a + UrlResolver<Id = S>>(
+        submission: Submission<S>,
+        url_resolver: &'a R,
+    ) -> Self {
+        let _ = url_resolver;
         Self {
-            command: SubmissionCommand::new(submission, url_resolver),
+            submission,
+            attempts: 0,
         }
-    }*/
+    }
+}
 
-struct SubmissionController {}
+#[cfg(test)]
+#[async_trait]
+impl<S: ScopeId> ExecuteCommand<S> for MockSubmissionCommand<S> {
+    async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error> {
+        self.attempts += 1;
+        if self.attempts < 3 {
+            Ok(SubmissionResponse::new(
+                "test".to_string(),
+                self.submission.scope_id.clone(),
+                503,
+                "Busy".to_string(),
+                self.attempts,
+            ))
+        } else {
+            Ok(SubmissionResponse::new(
+                "test".to_string(),
+                self.submission.scope_id.clone(),
+                200,
+                "Success".to_string(),
+                self.attempts,
+            ))
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+// Responsible for controlling retry behavior
+struct SubmissionController;
 
 impl SubmissionController {
-
-    async fn run<S: ScopeId, C: ExecuteCommand<S>>(mut command: C) -> Result<SubmissionResponse<S>, ClientError> {
+    async fn run<S: ScopeId, C: ExecuteCommand<S>>(
+        mut command: C,
+    ) -> Result<SubmissionResponse<S>, ClientError> {
         let mut wait: u64 = 250;
-        let mut response: Result<SubmissionResponse<S>, reqwest::Error> =
-            command.execute().await;
+        let mut response: Result<SubmissionResponse<S>, reqwest::Error> = command.execute().await;
         for _ in 1..RETRY_ATTEMPTS {
             match &response {
                 Ok(res) => match &res.status {
@@ -210,9 +247,17 @@ impl TaskHandler {
     ) {
         let batch_header = task.submission.batch_header().clone();
         let scope_id = task.submission.scope_id().clone();
+        #[cfg(not(test))]
+        let submission_command = SubmissionCommand::new(task.submission, url_resolver);
+
+        // Inject mock_submission_command for testing
+        // We should see if we can refine this - it means that the line above is never tested. It
+        // is a worthwhile tradeoff for the ability to thoroughly test the other components.
+        #[cfg(test)]
+        let submission_command = MockSubmissionCommand::new(task.submission, url_resolver);
+
         let submission: Result<SubmissionResponse<S>, ClientError> =
-            SubmissionController::run(SubmissionCommand::new(task.submission, url_resolver))
-                .await;
+            SubmissionController::run(submission_command).await;
 
         let task_message = match submission {
             Ok(s) => BatchMessage::SubmissionResponse(s),
@@ -224,286 +269,160 @@ impl TaskHandler {
         };
         let _ = task.tx.send(task_message);
     }
+
+    // Required to manage lifetimes within the tests
+    #[cfg(test)]
+    async fn test_spawn(task: NewTask<GlobalScopeId>) {
+        let mock_url_resolver = MockUrlResolver::new("test".to_string());
+        Self::spawn(task, &mock_url_resolver).await
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+struct MockUrlResolver {
+    url: String,
+}
+
+#[cfg(test)]
+impl MockUrlResolver {
+    fn new(url: String) -> Self {
+        Self { url }
+    }
+}
+
+#[cfg(test)]
+impl UrlResolver for MockUrlResolver {
+    type Id = GlobalScopeId;
+
+    fn url(&self, scope_id: &GlobalScopeId) -> String {
+        let _ = scope_id;
+        format!("{}/test", &self.url)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        super::{addresser::BatchAddresser, BatchTrackingId},
-        *,
-    };
-    use crate::batch_tracking::store::{TrackingBatch, TrackingBatchBuilder};
-    use crate::hex;
-    use actix_web::{post, rt, App, HttpResponse, HttpServer, Responder};
-    use cylinder::{secp256k1::Secp256k1Context, Context};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use transact::protocol::{
-        batch::BatchBuilder,
-        transaction::{HashMethod, TransactionBuilder},
-    };
-    // Implement a crude "random" Bernoulli distribution sampler for the /echo_maybe endpoint
-    // Avoids importing the rand crate, and this doesn't need to be a good random sampler
-    // Returns true roughly 1/3 of the time
-    fn poorly_random() -> bool {
-        let now = SystemTime::now();
-        let time = now.duration_since(UNIX_EPOCH).unwrap().as_micros();
-        (time % 3) == 0
-    }
-    // endpoints for rest APIs uses in tests
-    #[post("/echo")]
-    async fn echo(req_body: String) -> impl Responder {
-        HttpResponse::Ok().body(req_body)
-    }
-    #[post("/echo_maybe")]
-    async fn echo_maybe(req_body: String) -> impl Responder {
-        let v = poorly_random();
-        if v {
-            println!("ok");
-            HttpResponse::Ok().body(req_body)
-        } else {
-            println!("try again!");
-            HttpResponse::ServiceUnavailable().finish()
+    use super::*;
+    use crate::scope_id::GlobalScopeId;
+    use mockito;
+
+    // Convenient mock submission for testing
+    struct MockSubmission;
+
+    impl MockSubmission {
+        fn new() -> Submission<GlobalScopeId> {
+            Submission {
+                batch_header: "test".to_string(),
+                scope_id: GlobalScopeId::new(),
+                serialized_batch: vec![0, 0, 0, 0],
+            }
         }
     }
-    async fn run_rest_api(port: &str) -> std::io::Result<()> {
-        HttpServer::new(|| App::new().service(echo).service(echo_maybe))
-            .bind(format!("127.0.0.1:{}", port))?
-            .run()
-            .await
-    }
-    // We should make it easier to get a mock batch
-    struct MockTrackingBatch;
-    static FAMILY_NAME: &str = "test_family";
-    static FAMILY_VERSION: &str = "0.1";
-    static KEY1: &str = "111111111111111111111111111111111111111111111111111111111111111111";
-    static KEY2: &str = "222222222222222222222222222222222222222222222222222222222222222222";
-    static KEY3: &str = "333333333333333333333333333333333333333333333333333333333333333333";
-    static KEY4: &str = "444444444444444444444444444444444444444444444444444444444444444444";
-    static KEY5: &str = "555555555555555555555555555555555555555555555555555555555555555555";
-    static KEY6: &str = "666666666666666666666666666666666666666666666666666666666666666666";
-    static KEY7: &str = "777777777777777777777777777777777777777777777777777777777777777777";
-    static NONCE: &str = "f9kdzz";
-    static BYTES2: [u8; 4] = [0x05, 0x06, 0x07, 0x08];
-    impl MockTrackingBatch {
-        fn create(service_id: String) -> TrackingBatch {
-            let context = Secp256k1Context::new();
-            let key = context.new_random_private_key();
-            let signer = context.new_signer(key);
-            let pair = TransactionBuilder::new()
-                .with_batcher_public_key(hex::parse_hex(KEY1).unwrap())
-                .with_dependencies(vec![KEY2.to_string(), KEY3.to_string()])
-                .with_family_name(FAMILY_NAME.to_string())
-                .with_family_version(FAMILY_VERSION.to_string())
-                .with_inputs(vec![
-                    hex::parse_hex(KEY4).unwrap(),
-                    hex::parse_hex(&KEY5[0..4]).unwrap(),
-                ])
-                .with_nonce(NONCE.to_string().into_bytes())
-                .with_outputs(vec![
-                    hex::parse_hex(KEY6).unwrap(),
-                    hex::parse_hex(&KEY7[0..4]).unwrap(),
-                ])
-                .with_payload_hash_method(HashMethod::Sha512)
-                .with_payload(BYTES2.to_vec())
-                .build(&*signer)
-                .unwrap();
-            let batch_1 = BatchBuilder::new()
-                .with_transactions(vec![pair])
-                .build(&*signer)
-                .unwrap();
-            TrackingBatchBuilder::default()
-                .with_batch(batch_1)
-                .with_service_id(service_id)
-                .with_signer_public_key(KEY1.to_string())
-                .with_submitted(false)
-                .with_created_at(111111)
-                .build()
-                .unwrap()
-        }
-    }
-    #[test]
-    fn test_batch_submitter_batch_envelope_create() {
-        let test_addresser_wo_serv: Box<dyn Addresser + std::marker::Send> =
-            Box::new(BatchAddresser::new("http://127.0.0.1:8080", None));
-        let test_addresser_w_serv: Box<dyn Addresser + std::marker::Send> = Box::new(
-            BatchAddresser::new("http://127.0.0.1:8080", Some("service_id")),
-        );
-        let mock_batch_1 = MockTrackingBatch::create("".to_string());
-        let mock_batch_id_1 = BatchTrackingId::create(mock_batch_1);
-        let mock_batch_2 = MockTrackingBatch::create("123-abc".to_string());
-        let mock_batch_id_2 = BatchTrackingId::create(mock_batch_2);
-        let test_batch_submission_wo_serv = BatchSubmission {
-            id: mock_batch_id_1.clone(),
-            service_id: None,
-            serialized_batch: vec![1, 1, 1, 1],
-        };
-        let test_batch_submission_w_serv = BatchSubmission {
-            id: mock_batch_id_2.clone(),
-            service_id: Some("123-abc".to_string()),
-            serialized_batch: vec![2, 2, 2, 2],
-        };
-        assert_eq!(
-            BatchEnvelope::create(
-                test_batch_submission_wo_serv.clone(),
-                &test_addresser_wo_serv
-            )
-            .unwrap(),
-            BatchEnvelope {
-                id: mock_batch_id_1,
-                address: "http://127.0.0.1:8080".to_string(),
-                payload: vec![1, 1, 1, 1],
-            }
-        );
-        assert_eq!(
-            BatchEnvelope::create(test_batch_submission_w_serv.clone(), &test_addresser_w_serv)
-                .unwrap(),
-            BatchEnvelope {
-                id: mock_batch_id_2,
-                address: "http://127.0.0.1:8080?service_id=123-abc".to_string(),
-                payload: vec![2, 2, 2, 2],
-            }
-        );
-        assert!(
-            BatchEnvelope::create(test_batch_submission_wo_serv, &test_addresser_w_serv).is_err()
-        );
-        assert!(
-            BatchEnvelope::create(test_batch_submission_w_serv, &test_addresser_wo_serv).is_err()
-        );
-    }
-    #[test]
-    fn test_batch_submitter_submission_response_new() {
-        let mock_batch = MockTrackingBatch::create("".to_string());
-        let mock_batch_id = BatchTrackingId::create(mock_batch);
-        let response = SubmissionResponse::new(
-            mock_batch_id.clone(),
-            200,
-            "Everything is ok".to_string(),
-            1,
-        );
-        assert_eq!(&response.id, &mock_batch_id);
-        assert_eq!(&response.status, &200);
-        assert_eq!(&response.message, &"Everything is ok".to_string());
-        assert_eq!(&response.attempts, &1);
-    }
+
     #[test]
     fn test_batch_submitter_submission_command_new() {
-        let mock_batch = MockTrackingBatch::create("".to_string());
-        let mock_batch_id = BatchTrackingId::create(mock_batch);
-        let test_batch_envelope = BatchEnvelope {
-            id: mock_batch_id.clone(),
-            address: "http://127.0.0.1:8080".to_string(),
-            payload: vec![1, 1, 1, 1],
+        let mock_submission = MockSubmission::new();
+        let mock_url_resolver = MockUrlResolver::new("test.url".to_string());
+        let test_command = SubmissionCommand::new(mock_submission.clone(), &mock_url_resolver);
+        let expected_command = SubmissionCommand {
+            submission: mock_submission,
+            url_resolver: &mock_url_resolver,
+            attempts: 0,
         };
-        let test_submission_command = SubmissionCommand::new(test_batch_envelope);
-        assert_eq!(
-            test_submission_command,
-            SubmissionCommand {
-                batch_envelope: BatchEnvelope {
-                    id: mock_batch_id,
-                    address: "http://127.0.0.1:8080".to_string(),
-                    payload: vec![1, 1, 1, 1],
-                },
-                attempts: 0,
-            }
-        )
+        assert_eq!(test_command, expected_command);
     }
+
+    // NOTE: This test is the only reason we need to import tokio_0_2 as long as we use reqwest
+    // 0.10. Upon upgrading reqwest, this should use tokio 1.x.
     #[test]
     fn test_batch_submitter_submission_command_execute() {
-        let mock_batch = MockTrackingBatch::create("".to_string());
-        let mock_batch_id = BatchTrackingId::create(mock_batch);
-        // Test batch with echo endpoint
-        let test_batch_envelope = BatchEnvelope {
-            id: mock_batch_id.clone(),
-            address: "http://127.0.0.1:8085/echo".to_string(),
-            payload: vec![1, 1, 1, 1],
-        };
-        let mut test_submission_command = SubmissionCommand::new(test_batch_envelope);
-        let expected_response =
-            SubmissionResponse::new(mock_batch_id, 200, "\u{1}\u{1}\u{1}\u{1}".to_string(), 1);
-        // Start REST API
-        std::thread::Builder::new()
-            .name("test_rest_api_runtime".to_string())
-            .spawn(move || {
-                rt::System::new("rest_api").block_on(async { run_rest_api("8085").await.unwrap() })
-            })
-            .unwrap();
-        let test_execute = Builder::new_current_thread()
-            .thread_name("test_thread_submission_command")
-            .enable_all()
-            .build()
+        let url = mockito::server_url();
+        let _m1 = mockito::mock("POST", "/test").with_body("success").create();
+        let mock_submission = MockSubmission::new();
+        let mock_url_resolver = MockUrlResolver::new(url);
+        let mut test_command = SubmissionCommand::new(mock_submission, &mock_url_resolver);
+        let expected_response = SubmissionResponse::new(
+            "test".to_string(),
+            GlobalScopeId::new(),
+            200,
+            "success".to_string(),
+            1,
+        );
+
+        let response = tokio_0_2::runtime::Runtime::new()
             .unwrap()
-            .block_on(async move { test_submission_command.execute().await.unwrap() });
-        assert_eq!(test_execute, expected_response);
+            .block_on(async move { test_command.execute().await.unwrap() });
+
+        assert_eq!(response, expected_response);
     }
-    #[test]
-    fn test_batch_submitter_submission_controller_new() {
-        let mock_batch = MockTrackingBatch::create("".to_string());
-        let mock_batch_id = BatchTrackingId::create(mock_batch);
-        let test_batch_envelope = BatchEnvelope {
-            id: mock_batch_id.clone(),
-            address: "http://127.0.0.1:8080/echo".to_string(),
-            payload: vec![1, 1, 1, 1],
-        };
-        let test_submission_controller = SubmissionController::new(test_batch_envelope);
-        assert_eq!(
-            test_submission_controller,
-            SubmissionController {
-                command: SubmissionCommand {
-                    batch_envelope: BatchEnvelope {
-                        id: mock_batch_id.clone(),
-                        address: "http://127.0.0.1:8080/echo".to_string(),
-                        payload: vec![1, 1, 1, 1],
-                    },
-                    attempts: 0,
-                }
-            }
-        )
-    }
+
     #[test]
     fn test_batch_submitter_submission_controller_run() {
-        let mock_batch = MockTrackingBatch::create("".to_string());
-        let mock_batch_id = BatchTrackingId::create(mock_batch);
-        // Test batch with echo endpoint
-        let test_batch_envelope_1 = BatchEnvelope {
-            id: mock_batch_id.clone(),
-            address: "http://127.0.0.1:8086/echo".to_string(),
-            payload: vec![1, 1, 1, 1],
-        };
-        let mut test_submission_controller_1 = SubmissionController::new(test_batch_envelope_1);
-        // Test batch with echo_maybe endpoint to test retry behavior
-        let test_batch_envelope_2 = BatchEnvelope {
-            id: mock_batch_id.clone(),
-            address: "http://127.0.0.1:8086/echo_maybe".to_string(),
-            payload: vec![1, 1, 1, 1],
-        };
-        let mut test_submission_controller_2 = SubmissionController::new(test_batch_envelope_2);
-        let expected_response =
-            SubmissionResponse::new(mock_batch_id, 200, "\u{1}\u{1}\u{1}\u{1}".to_string(), 1);
-        // Start REST API
-        std::thread::Builder::new()
-            .name("submitter_async_runtime_host".to_string())
+        let mock_submission = MockSubmission::new();
+        let mock_url_resolver = MockUrlResolver::new("throw-away-url".to_string());
+        let mock_submission_command =
+            MockSubmissionCommand::new(mock_submission, &mock_url_resolver);
+        let expected_response = SubmissionResponse::new(
+            "test".to_string(),
+            GlobalScopeId::new(),
+            200,
+            "Success".to_string(),
+            3,
+        );
+        let response = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                SubmissionController::run(mock_submission_command)
+                    .await
+                    .unwrap()
+            });
+
+        assert_eq!(response, expected_response);
+    }
+
+    #[test]
+    fn test_batch_submitter_task_handler_spawn() {
+        let mock_submission = MockSubmission::new();
+        let expected_response = SubmissionResponse::new(
+            "test".to_string(),
+            GlobalScopeId::new(),
+            200,
+            "Success".to_string(),
+            3,
+        );
+        let (tx, rx): (
+            std::sync::mpsc::Sender<BatchMessage<GlobalScopeId>>,
+            std::sync::mpsc::Receiver<BatchMessage<GlobalScopeId>>,
+        ) = std::sync::mpsc::channel();
+        let mock_new_task = NewTask::new(tx, mock_submission);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .thread_name("test_task_runtime")
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = std::thread::Builder::new()
+            .name("test_task_runtime_thread".to_string())
             .spawn(move || {
-                rt::System::new("rest_api").block_on(async { run_rest_api("8086").await.unwrap() })
+                runtime.block_on(async move {
+                    tokio::task::spawn(
+                        TaskHandler::test_spawn(mock_new_task)
+                    );
+                    // Let the above task finish before dropping the runtime
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                });
             })
             .unwrap();
-        let test_run_1 = Builder::new_current_thread()
-            .thread_name("test_thread_submission_controller_run_1")
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async move { test_submission_controller_1.run().await.unwrap() });
-        let test_run_2 = Builder::new_current_thread()
-            .thread_name("test_thread_submission_controller_run_2")
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async move { test_submission_controller_2.run().await.unwrap() });
-        assert_eq!(test_run_1, expected_response);
-        assert_eq!(test_run_2.id, expected_response.id);
-        assert_eq!(test_run_2.status, expected_response.status);
-        assert_eq!(test_run_2.message, expected_response.message);
-        assert!(test_run_2.attempts >= 1 && test_run_2.attempts <= 10);
+        let response = rx.recv().unwrap();
+        let _ = handle.join();
+
+        assert_eq!(
+            response,
+            BatchMessage::SubmissionResponse(expected_response)
+        );
     }
+
+    /*
     #[test]
     fn test_batch_submitter_task_handler_spawn() {
         let mock_batch = MockTrackingBatch::create("".to_string());
@@ -596,5 +515,5 @@ mod tests {
         submitter.shutdown().unwrap();
         assert_eq!(first_response, first_expected_response);
         assert_eq!(second_response, second_expected_response);
-    }
+    }*/
 }
