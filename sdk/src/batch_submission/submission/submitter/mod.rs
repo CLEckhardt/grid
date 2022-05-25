@@ -21,34 +21,23 @@ use crate::{
     scope_id::ScopeId,
 };
 
-/// The interface for a submitter builder. Note that a submitter builder implementation may have
-/// more methods than this (ex. for testing).
-pub trait SubmitterBuilder<
-    S: ScopeId,
-    R: UrlResolver<Id = S> + Sync + Send,
-    Q: Iterator<Item = Submission<S>> + Send,
-    O: SubmitterObserver<Id = S> + Send,
->
-{
-    type RunnableSubmitter: RunnableSubmitter<S, R, Q, O>;
+mod async_batch_submitter;
+use async_batch_submitter::*;
 
-    fn new() -> Self;
+/*
 
-    fn with_url_resolver(&mut self, url_resolver: &'static R);
+Notes:
+Builder should be a struct and not a trait - creates something that implements RunnableSubmitter
+Look at changing some of these to box dyn and think about type definitions
+Maybe the observer can be a reference
 
-    fn with_queue(&mut self, queue: Q);
+*/
 
-    fn with_observer(&mut self, observer: O);
-
-    fn build(self) -> Result<Self::RunnableSubmitter, InternalError>;
-}
 
 /// The interface for a submitter that is built but not yet running.
 pub trait RunnableSubmitter<
     S: ScopeId,
-    R: UrlResolver<Id = S> + Sync + Send,
     Q: Iterator<Item = Submission<S>> + Send,
-    O: SubmitterObserver<Id = S> + Send,
 >
 {
     type RunningSubmitter: RunningSubmitter;

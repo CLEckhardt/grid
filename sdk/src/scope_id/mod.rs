@@ -30,7 +30,7 @@ pub trait ValidId {
 }
 
 /// The scope ID trait.
-pub trait ScopeId: ValidId + Clone + PartialEq + Sync + Send {
+pub trait ScopeId: 'static + ValidId + std::fmt::Debug + Clone + PartialEq + Sync + Send {
     // Require a collection of trait bounds for a valid scope id
 }
 
