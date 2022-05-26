@@ -15,7 +15,7 @@
 use crate::scope_id::ScopeId;
 
 /// An interface for interpretting and recording updates from the submitter
-pub trait SubmitterObserver {
+pub trait SubmitterObserver: Sync + Send {
     type Id: ScopeId;
     /// Notify the observer of an update. The interpretation and recording
     /// of the update is determined by the observer's implementation.
