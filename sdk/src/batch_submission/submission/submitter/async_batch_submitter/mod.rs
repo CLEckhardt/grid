@@ -49,7 +49,7 @@ pub struct BatchSubmitterBuilder<
 impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
     BatchSubmitterBuilder<S, Q>
 {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             url_resolver: None,
             queue: None,
@@ -58,23 +58,23 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
         }
     }
 
-    fn with_url_resolver(&mut self, url_resolver: &'static Box<dyn UrlResolver<Id = S>>) {
+    pub fn with_url_resolver(&mut self, url_resolver: &'static Box<dyn UrlResolver<Id = S>>) {
         self.url_resolver = Some(url_resolver);
     }
 
-    fn with_queue(&mut self, queue: Q) {
+    pub fn with_queue(&mut self, queue: Q) {
         self.queue = Some(queue);
     }
 
-    fn with_observer(&mut self, observer: &'static Box<dyn SubmitterObserver<Id = S> + Send>) {
+    pub fn with_observer(&mut self, observer: &'static Box<dyn SubmitterObserver<Id = S> + Send>) {
         self.observer = Some(observer);
     }
 
-    fn with_mock_submission_command(&mut self) {
+    pub fn with_mock_submission_command(&mut self) {
         self.mock_execution = true;
     }
 
-    fn build(self) -> Result<BatchRunnableSubmitter<S, Q>, InternalError> {
+    pub fn build(self) -> Result<BatchRunnableSubmitter<S, Q>, InternalError> {
         let queue = match self.queue {
             Some(q) => q,
             None => {
@@ -201,10 +201,7 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
                             CentralMessage::NewTask(t) => {
                                 tokio::spawn(TaskHandler::spawn(
                                     t,
-// PROBLEM HERE
-// Can't clone because that makes the factory trait not object-safe
-// Can't use reference because the factory isn't static
-                                    submitter_command_factory.clone(),
+                                    submitter_command_factory.clone_factory(),
                                 ));
                             }
                             CentralMessage::Terminate => break,
@@ -360,8 +357,27 @@ impl RunningSubmitter for BatchRunningSubmitter {
     }
 }
 
-pub trait ExecuteCommandFactory<S: ScopeId>: Clone + Sync + Send {
+// Clone the factory in a trait-object-safe way
+trait CloneFactory<S: ScopeId> {
+    fn clone_factory(&self) -> Box<dyn ExecuteCommandFactory<S>>;
+}
+
+#[async_trait]
+trait ExecuteCommand<S: ScopeId>: Sync + Send {
+    async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error>;
+}
+
+trait ExecuteCommandFactory<S: ScopeId>: CloneFactory<S> + Sync + Send {
     fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>>;
+}
+
+impl<S: ScopeId, T> CloneFactory<S> for T
+where
+    T: ExecuteCommandFactory<S> + Clone + 'static,
+{
+    fn clone_factory(&self) -> Box<dyn ExecuteCommandFactory<S>> {
+        Box::new(self.clone())
+    }
 }
 
 #[derive(Clone)]
@@ -398,9 +414,9 @@ impl<S: ScopeId> MockSubmissionCommandFactory<S> {
 
 impl<S: ScopeId> ExecuteCommandFactory<S> for MockSubmissionCommandFactory<S> {
     fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>> {
-        let _ = submission;
         Box::new(MockSubmissionCommand {
             url_resolver: self.url_resolver,
+            submission,
             attempts: 0,
         })
     }
@@ -408,19 +424,33 @@ impl<S: ScopeId> ExecuteCommandFactory<S> for MockSubmissionCommandFactory<S> {
 
 struct MockSubmissionCommand<S: ScopeId> {
     url_resolver: &'static Box<dyn UrlResolver<Id = S>>,
+    submission: Submission<S>,
     attempts: u16,
 }
 
 #[async_trait]
 impl<S: ScopeId> ExecuteCommand<S> for MockSubmissionCommand<S> {
     async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error> {
-        todo!()
+        let _ = &self.url_resolver;
+        self.attempts += 1;
+        if self.attempts < 3 {
+            Ok(SubmissionResponse::new(
+                "test".to_string(),
+                self.submission.scope_id.clone(),
+                503,
+                "Busy".to_string(),
+                self.attempts,
+            ))
+        } else {
+            Ok(SubmissionResponse::new(
+                "test".to_string(),
+                self.submission.scope_id.clone(),
+                200,
+                "Success".to_string(),
+                self.attempts,
+            ))
+        }
     }
-}
-
-#[async_trait]
-pub trait ExecuteCommand<S: ScopeId>: Sync + Send {
-    async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error>;
 }
 
 //
@@ -600,4 +630,54 @@ struct ErrorResponse<S: ScopeId> {
     batch_header: String,
     scope_id: S,
     error: String,
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use crate::scope_id::GlobalScopeId;
+    use mockito;
+
+    // Convenient mock submission for testing
+    struct MockSubmission;
+
+    impl MockSubmission {
+        fn new() -> Submission<GlobalScopeId> {
+            Submission {
+                batch_header: "test".to_string(),
+                scope_id: GlobalScopeId::new(),
+                serialized_batch: vec![0, 0, 0, 0],
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct MockUrlResolver {
+        url: String,
+    }
+
+    impl MockUrlResolver {
+        fn new(url: String) -> Self {
+            Self { url }
+        }
+    }
+
+    impl UrlResolver for MockUrlResolver {
+        type Id = GlobalScopeId;
+
+        fn url(&self, scope_id: &GlobalScopeId) -> String {
+            let _ = scope_id;
+            format!("{}/test", &self.url)
+        }
+    }
+
+    static MOCK_URL_RESOLVER: Box<MockUrlResolver> = Box::new(MockUrlResolver::new("test".to_string()));
+
+    #[test]
+    fn test_batch_submitter_submission_command_factory() {
+        let mock_url_resolver = Box::new(MockUrlResolver::new("test".to_string()));
+        let submission_command_factory = SubmissionCommandFactory::new(&mock_url_resolver);
+    }
+
 }
