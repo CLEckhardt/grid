@@ -14,7 +14,7 @@
 
 use async_trait::async_trait;
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use crate::{
     batch_submission::{
@@ -40,7 +40,7 @@ pub struct BatchSubmitterBuilder<
     S: 'static + ScopeId,
     Q: 'static + Iterator<Item = Submission<S>> + Send,
 > {
-    url_resolver: Option<&'static Box<dyn UrlResolver<Id = S>>>,
+    url_resolver: Option<Arc<dyn UrlResolver<Id = S>>>,
     queue: Option<Q>,
     observer: Option<&'static Box<dyn SubmitterObserver<Id = S> + Send>>,
     mock_execution: bool,
@@ -58,7 +58,7 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
         }
     }
 
-    pub fn with_url_resolver(&mut self, url_resolver: &'static Box<dyn UrlResolver<Id = S>>) {
+    pub fn with_url_resolver(&mut self, url_resolver: Arc<dyn UrlResolver<Id = S>>) {
         self.url_resolver = Some(url_resolver);
     }
 
@@ -363,7 +363,7 @@ trait CloneFactory<S: ScopeId> {
 }
 
 #[async_trait]
-trait ExecuteCommand<S: ScopeId>: Sync + Send {
+trait ExecuteCommand<S: ScopeId>: std::fmt::Debug + Sync + Send {
     async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error>;
 }
 
@@ -380,13 +380,13 @@ where
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct SubmissionCommandFactory<S: ScopeId> {
-    url_resolver: &'static Box<dyn UrlResolver<Id = S>>,
+    url_resolver: Arc<dyn UrlResolver<Id = S>>,
 }
 
 impl<S: ScopeId> SubmissionCommandFactory<S> {
-    fn new(url_resolver: &'static Box<dyn UrlResolver<Id = S>>) -> Self {
+    fn new(url_resolver: Arc<dyn UrlResolver<Id = S>>) -> Self {
         Self { url_resolver }
     }
 }
@@ -394,20 +394,20 @@ impl<S: ScopeId> SubmissionCommandFactory<S> {
 impl<S: ScopeId> ExecuteCommandFactory<S> for SubmissionCommandFactory<S> {
     fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>> {
         Box::new(SubmissionCommand {
-            url_resolver: self.url_resolver,
+            url_resolver: Arc::clone(&self.url_resolver),
             submission,
             attempts: 0,
         })
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct MockSubmissionCommandFactory<S: ScopeId> {
-    url_resolver: &'static Box<dyn UrlResolver<Id = S>>,
+    url_resolver: Arc<dyn UrlResolver<Id = S>>,
 }
 
 impl<S: ScopeId> MockSubmissionCommandFactory<S> {
-    fn new(url_resolver: &'static Box<dyn UrlResolver<Id = S>>) -> Self {
+    fn new(url_resolver: Arc<dyn UrlResolver<Id = S>>) -> Self {
         Self { url_resolver }
     }
 }
@@ -415,15 +415,16 @@ impl<S: ScopeId> MockSubmissionCommandFactory<S> {
 impl<S: ScopeId> ExecuteCommandFactory<S> for MockSubmissionCommandFactory<S> {
     fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>> {
         Box::new(MockSubmissionCommand {
-            url_resolver: self.url_resolver,
+            url_resolver: Arc::clone(&self.url_resolver),
             submission,
             attempts: 0,
         })
     }
 }
 
+#[derive(Debug)]
 struct MockSubmissionCommand<S: ScopeId> {
-    url_resolver: &'static Box<dyn UrlResolver<Id = S>>,
+    url_resolver: Arc<dyn UrlResolver<Id = S>>,
     submission: Submission<S>,
     attempts: u16,
 }
@@ -462,7 +463,7 @@ impl<S: ScopeId> ExecuteCommand<S> for MockSubmissionCommand<S> {
 #[derive(Debug)]
 // Responsible for executing the submission request
 struct SubmissionCommand<S: ScopeId> {
-    url_resolver: &'static Box<dyn UrlResolver<Id = S>>,
+    url_resolver: Arc<dyn UrlResolver<Id = S>>,
     submission: Submission<S>,
     attempts: u16,
 }
@@ -672,12 +673,13 @@ mod tests {
         }
     }
 
-    static MOCK_URL_RESOLVER: Box<MockUrlResolver> = Box::new(MockUrlResolver::new("test".to_string()));
-
     #[test]
+    // This test does nothing more than ensure that the only type returned by
+    // SubmissionCommandFactory is a SubmissionCommand (since we are using dynamic dispatch)
     fn test_batch_submitter_submission_command_factory() {
-        let mock_url_resolver = Box::new(MockUrlResolver::new("test".to_string()));
-        let submission_command_factory = SubmissionCommandFactory::new(&mock_url_resolver);
+        let mock_url_resolver = MockUrlResolver::new("test".to_string());
+        let submission_command_factory =
+            SubmissionCommandFactory::new(Arc::new(mock_url_resolver));
+        //let _: Box<SubmissionCommand<GlobalScopeId>> = submission_command_factory.new_command(MockSubmission::new());
     }
-
 }
