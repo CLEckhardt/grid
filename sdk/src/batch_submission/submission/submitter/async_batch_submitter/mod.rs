@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+use reqwest::Client;
 
 use std::{fmt, sync::Arc};
 
@@ -36,45 +37,47 @@ const POLLING_INTERVAL: u64 = 1000;
 
 // Implementing generics now
 
-pub struct BatchSubmitterBuilder<
-    S: 'static + ScopeId,
-    Q: 'static + Iterator<Item = Submission<S>> + Send,
-> {
+pub struct BatchSubmitterBuilder<S: 'static + ScopeId> {
     url_resolver: Option<Arc<dyn UrlResolver<Id = S>>>,
-    queue: Option<Q>,
-    observer: Option<&'static Box<dyn SubmitterObserver<Id = S> + Send>>,
-    mock_execution: bool,
+    queue: Option<Box<(dyn Iterator<Item = Submission<S>> + Send)>>,
+    observer: Option<Box<dyn SubmitterObserver<Id = S> + Send>>,
+    submission_command_factory: Option<Box<dyn ExecuteCommandFactory<S>>>,
 }
 
-impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
-    BatchSubmitterBuilder<S, Q>
-{
+impl<S: 'static + ScopeId> BatchSubmitterBuilder<S> {
     pub fn new() -> Self {
         Self {
             url_resolver: None,
             queue: None,
             observer: None,
-            mock_execution: false,
+            submission_command_factory: None,
         }
     }
 
-    pub fn with_url_resolver(&mut self, url_resolver: Arc<dyn UrlResolver<Id = S>>) {
+    pub fn with_url_resolver(mut self, url_resolver: Arc<dyn UrlResolver<Id = S>>) -> Self {
         self.url_resolver = Some(url_resolver);
+        self
     }
 
-    pub fn with_queue(&mut self, queue: Q) {
+    pub fn with_queue(mut self, queue: Box<(dyn Iterator<Item = Submission<S>> + Send)>) -> Self {
         self.queue = Some(queue);
+        self
     }
 
-    pub fn with_observer(&mut self, observer: &'static Box<dyn SubmitterObserver<Id = S> + Send>) {
+    pub fn with_observer(mut self, observer: Box<dyn SubmitterObserver<Id = S> + Send>) -> Self {
         self.observer = Some(observer);
+        self
     }
 
-    pub fn with_mock_submission_command(&mut self) {
-        self.mock_execution = true;
+    pub fn with_submission_command_factory(
+        mut self,
+        factory: Box<dyn ExecuteCommandFactory<S> + Send>,
+    ) -> Self {
+        self.submission_command_factory = Some(factory);
+        self
     }
 
-    pub fn build(self) -> Result<BatchRunnableSubmitter<S, Q>, InternalError> {
+    pub fn build(self) -> Result<BatchRunnableSubmitter<S>, InternalError> {
         let queue = match self.queue {
             Some(q) => q,
             None => {
@@ -91,36 +94,28 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
                 ))
             }
         };
-        if self.mock_execution {
-            let command_factory = match self.url_resolver {
-                Some(u) => MockSubmissionCommandFactory::new(u),
-                None => {
-                    return Err(InternalError::with_message(
-                        "Cannot build BatchRunnableSubmitter, missing url resolver.".to_string(),
-                    ))
-                }
-            };
-            BatchRunnableSubmitter::new(queue, observer, Box::new(command_factory))
-        } else {
-            let command_factory = match self.url_resolver {
-                Some(u) => SubmissionCommandFactory::new(u),
-                None => {
-                    return Err(InternalError::with_message(
-                        "Cannot build BatchRunnableSubmitter, missing url resolver.".to_string(),
-                    ))
-                }
-            };
-            BatchRunnableSubmitter::new(queue, observer, Box::new(command_factory))
+        match self.submission_command_factory {
+            // If a command_factory is provided, a url_resolver does not need to be
+            Some(f) => BatchRunnableSubmitter::new(queue, observer, f),
+            None => {
+                let command_factory = match self.url_resolver {
+                    Some(u) => SubmissionCommandFactory::new(u),
+                    None => {
+                        return Err(InternalError::with_message(
+                            "Cannot build BatchRunnableSubmitter, missing url resolver."
+                                .to_string(),
+                        ))
+                    }
+                };
+                BatchRunnableSubmitter::new(queue, observer, Box::new(command_factory))
+            }
         }
     }
 }
 
-pub struct BatchRunnableSubmitter<
-    S: 'static + ScopeId,
-    Q: 'static + Iterator<Item = Submission<S>> + Send,
-> {
-    queue: Q,
-    observer: &'static Box<dyn SubmitterObserver<Id = S> + Send>,
+pub struct BatchRunnableSubmitter<S: 'static + ScopeId> {
+    queue: Box<(dyn Iterator<Item = Submission<S>> + Send)>,
+    observer: Box<dyn SubmitterObserver<Id = S> + Send>,
     command_factory: Box<dyn ExecuteCommandFactory<S>>,
     leader_channel: (
         std::sync::mpsc::Sender<TerminateMessage>,
@@ -141,12 +136,10 @@ pub struct BatchRunnableSubmitter<
     runtime: tokio::runtime::Runtime,
 }
 
-impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
-    BatchRunnableSubmitter<S, Q>
-{
+impl<S: 'static + ScopeId> BatchRunnableSubmitter<S> {
     fn new(
-        queue: Q,
-        observer: &'static Box<dyn SubmitterObserver<Id = S> + Send>,
+        queue: Box<(dyn Iterator<Item = Submission<S>> + Send)>,
+        observer: Box<dyn SubmitterObserver<Id = S> + Send>,
         command_factory: Box<dyn ExecuteCommandFactory<S>>,
     ) -> Result<Self, InternalError> {
         Ok(Self {
@@ -166,9 +159,7 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
     }
 }
 
-impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
-    RunnableSubmitter<S, Q> for BatchRunnableSubmitter<S, Q>
-{
+impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
     type RunningSubmitter = BatchRunningSubmitter;
 
     fn run(self) -> Result<BatchRunningSubmitter, InternalError> {
@@ -245,7 +236,7 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
                             };
                         }
                         None => {
-                            std::thread::sleep(tokio::time::Duration::from_millis(POLLING_INTERVAL))
+                            std::thread::sleep(std::time::Duration::from_millis(POLLING_INTERVAL))
                         }
                     }
                 }
@@ -358,16 +349,16 @@ impl RunningSubmitter for BatchRunningSubmitter {
 }
 
 // Clone the factory in a trait-object-safe way
-trait CloneFactory<S: ScopeId> {
+pub trait CloneFactory<S: ScopeId> {
     fn clone_factory(&self) -> Box<dyn ExecuteCommandFactory<S>>;
 }
 
 #[async_trait]
-trait ExecuteCommand<S: ScopeId>: std::fmt::Debug + Sync + Send {
+pub trait ExecuteCommand<S: ScopeId>: fmt::Debug + Sync + Send {
     async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error>;
 }
 
-trait ExecuteCommandFactory<S: ScopeId>: CloneFactory<S> + Sync + Send {
+pub trait ExecuteCommandFactory<S: ScopeId>: CloneFactory<S> + Sync + Send {
     fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>>;
 }
 
@@ -401,59 +392,6 @@ impl<S: ScopeId> ExecuteCommandFactory<S> for SubmissionCommandFactory<S> {
     }
 }
 
-#[derive(Clone, Debug)]
-struct MockSubmissionCommandFactory<S: ScopeId> {
-    url_resolver: Arc<dyn UrlResolver<Id = S>>,
-}
-
-impl<S: ScopeId> MockSubmissionCommandFactory<S> {
-    fn new(url_resolver: Arc<dyn UrlResolver<Id = S>>) -> Self {
-        Self { url_resolver }
-    }
-}
-
-impl<S: ScopeId> ExecuteCommandFactory<S> for MockSubmissionCommandFactory<S> {
-    fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>> {
-        Box::new(MockSubmissionCommand {
-            url_resolver: Arc::clone(&self.url_resolver),
-            submission,
-            attempts: 0,
-        })
-    }
-}
-
-#[derive(Debug)]
-struct MockSubmissionCommand<S: ScopeId> {
-    url_resolver: Arc<dyn UrlResolver<Id = S>>,
-    submission: Submission<S>,
-    attempts: u16,
-}
-
-#[async_trait]
-impl<S: ScopeId> ExecuteCommand<S> for MockSubmissionCommand<S> {
-    async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error> {
-        let _ = &self.url_resolver;
-        self.attempts += 1;
-        if self.attempts < 3 {
-            Ok(SubmissionResponse::new(
-                "test".to_string(),
-                self.submission.scope_id.clone(),
-                503,
-                "Busy".to_string(),
-                self.attempts,
-            ))
-        } else {
-            Ok(SubmissionResponse::new(
-                "test".to_string(),
-                self.submission.scope_id.clone(),
-                200,
-                "Success".to_string(),
-                self.attempts,
-            ))
-        }
-    }
-}
-
 //
 //
 //
@@ -471,7 +409,7 @@ struct SubmissionCommand<S: ScopeId> {
 #[async_trait]
 impl<S: ScopeId> ExecuteCommand<S> for SubmissionCommand<S> {
     async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error> {
-        let client = reqwest::Client::builder()
+        let client = Client::builder()
             .timeout(tokio::time::Duration::from_secs(15))
             .build()?;
 
@@ -564,7 +502,7 @@ impl TaskHandler {
 
 #[derive(Debug, PartialEq)]
 // Carries the submission response from the http client back through the submitter to the observer
-struct SubmissionResponse<S: ScopeId> {
+pub struct SubmissionResponse<S: ScopeId> {
     batch_header: String,
     scope_id: S,
     status: u16,
@@ -636,6 +574,11 @@ struct ErrorResponse<S: ScopeId> {
 #[cfg(test)]
 mod tests {
 
+    // NOTE: It's not possible to test that a SubmissionCommandFactory produces a SubmissionCommand
+    // and not a MockSubmissionCommand here, but that should be caught in the intergration tests.
+
+    use std::sync::Mutex;
+
     use super::*;
     use crate::scope_id::GlobalScopeId;
     use mockito;
@@ -649,6 +592,59 @@ mod tests {
                 batch_header: "test".to_string(),
                 scope_id: GlobalScopeId::new(),
                 serialized_batch: vec![0, 0, 0, 0],
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MockSubmissionCommandFactory<S: ScopeId> {
+        url_resolver: Arc<dyn UrlResolver<Id = S>>,
+    }
+
+    impl<S: ScopeId> MockSubmissionCommandFactory<S> {
+        fn new(url_resolver: Arc<dyn UrlResolver<Id = S>>) -> Self {
+            Self { url_resolver }
+        }
+    }
+
+    impl<S: ScopeId> ExecuteCommandFactory<S> for MockSubmissionCommandFactory<S> {
+        fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>> {
+            Box::new(MockSubmissionCommand {
+                url_resolver: Arc::clone(&self.url_resolver),
+                submission,
+                attempts: 0,
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct MockSubmissionCommand<S: ScopeId> {
+        url_resolver: Arc<dyn UrlResolver<Id = S>>,
+        submission: Submission<S>,
+        attempts: u16,
+    }
+
+    #[async_trait]
+    impl<S: ScopeId> ExecuteCommand<S> for MockSubmissionCommand<S> {
+        async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error> {
+            let _ = &self.url_resolver;
+            self.attempts += 1;
+            if self.attempts < 3 {
+                Ok(SubmissionResponse::new(
+                    "test".to_string(),
+                    self.submission.scope_id.clone(),
+                    503,
+                    "Busy".to_string(),
+                    self.attempts,
+                ))
+            } else {
+                Ok(SubmissionResponse::new(
+                    "test".to_string(),
+                    self.submission.scope_id.clone(),
+                    200,
+                    "Success".to_string(),
+                    self.attempts,
+                ))
             }
         }
     }
@@ -673,13 +669,152 @@ mod tests {
         }
     }
 
+    struct MockRegister {
+        register: Arc<Mutex<Vec<(String, Option<u16>, Option<String>)>>>,
+    }
+
+    impl MockRegister {
+        fn new() -> Self {
+            Self {
+                register: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    struct MockObserver {
+        register_ref: Arc<Mutex<Vec<(String, Option<u16>, Option<String>)>>>,
+    }
+    impl SubmitterObserver for MockObserver {
+        type Id = GlobalScopeId;
+        fn notify(
+            &self,
+            batch_header: String,
+            scope_id: Self::Id,
+            status: Option<u16>,
+            message: Option<String>,
+        ) {
+            let _ = scope_id;
+            let mut reg = self.register_ref.lock().unwrap();
+            reg.push((batch_header, status, message));
+        }
+    }
+
     #[test]
-    // This test does nothing more than ensure that the only type returned by
-    // SubmissionCommandFactory is a SubmissionCommand (since we are using dynamic dispatch)
-    fn test_batch_submitter_submission_command_factory() {
-        let mock_url_resolver = MockUrlResolver::new("test".to_string());
-        let submission_command_factory =
-            SubmissionCommandFactory::new(Arc::new(mock_url_resolver));
-        //let _: Box<SubmissionCommand<GlobalScopeId>> = submission_command_factory.new_command(MockSubmission::new());
+    fn test_batch_submitter_submission_command_execute() {
+        let url = mockito::server_url();
+        let _m1 = mockito::mock("POST", "/test").with_body("success").create();
+        let mock_submission = MockSubmission::new();
+        let mock_url_resolver = Arc::new(MockUrlResolver::new(url));
+        let test_submission_command_factory = SubmissionCommandFactory::new(mock_url_resolver);
+        let mut test_command = test_submission_command_factory.new_command(mock_submission);
+        let expected_response = SubmissionResponse::new(
+            "test".to_string(),
+            GlobalScopeId::new(),
+            200,
+            "success".to_string(),
+            1,
+        );
+
+        let response = tokio_0_2::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move { test_command.execute().await.unwrap() });
+
+        assert_eq!(response, expected_response);
+    }
+
+    #[test]
+    fn test_batch_submitter_submission_controller_run() {
+        let mock_submission = MockSubmission::new();
+        let mock_url_resolver = Arc::new(MockUrlResolver::new("throwaway_url".to_string()));
+        let mock_submission_command_factory = MockSubmissionCommandFactory::new(mock_url_resolver);
+        let mock_submission_command = mock_submission_command_factory.new_command(mock_submission);
+        let expected_response = SubmissionResponse::new(
+            "test".to_string(),
+            GlobalScopeId::new(),
+            200,
+            "Success".to_string(),
+            3,
+        );
+        let response = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                SubmissionController::run(mock_submission_command)
+                    .await
+                    .unwrap()
+            });
+
+        assert_eq!(response, expected_response);
+    }
+
+    #[test]
+    fn test_batch_submitter_task_handler_spawn() {
+        let mock_submission = MockSubmission::new();
+        let mock_url_resolver = Arc::new(MockUrlResolver::new("throwaway_url".to_string()));
+        let mock_submission_command_factory = MockSubmissionCommandFactory::new(mock_url_resolver);
+        let expected_response = SubmissionResponse::new(
+            "test".to_string(),
+            GlobalScopeId::new(),
+            200,
+            "Success".to_string(),
+            3,
+        );
+        let (tx, rx): (
+            std::sync::mpsc::Sender<BatchMessage<GlobalScopeId>>,
+            std::sync::mpsc::Receiver<BatchMessage<GlobalScopeId>>,
+        ) = std::sync::mpsc::channel();
+        let mock_new_task = NewTask::new(tx, mock_submission);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .thread_name("test_task_runtime")
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = std::thread::Builder::new()
+            .name("test_task_runtime_thread".to_string())
+            .spawn(move || {
+                runtime.block_on(async move {
+                    tokio::spawn(TaskHandler::spawn(
+                        mock_new_task,
+                        mock_submission_command_factory.clone_factory(),
+                    ));
+                    // Let the above task finish before dropping the runtime
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                });
+            })
+            .unwrap();
+        let response = rx.recv().unwrap();
+        let _ = handle.join();
+
+        assert_eq!(
+            response,
+            BatchMessage::SubmissionResponse(expected_response)
+        );
+    }
+
+    #[test]
+    fn test_batch_submitter_submission_service() {
+        let mock_queue = vec![MockSubmission::new()];
+        let mock_url_resolver = Arc::new(MockUrlResolver::new("throwaway_url".to_string()));
+        let mock_submission_command_factory = MockSubmissionCommandFactory::new(mock_url_resolver);
+        let mock_register = MockRegister::new();
+        let mock_observer = MockObserver {
+            register_ref: Arc::clone(&mock_register.register),
+        };
+        let runnable_submitter = BatchSubmitterBuilder::new()
+            .with_queue(Box::new(mock_queue.into_iter()))
+            .with_observer(Box::new(mock_observer))
+            .with_submission_command_factory(Box::new(mock_submission_command_factory))
+            .build()
+            .unwrap();
+        let submitter_service = runnable_submitter.run().unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let expected_register = vec![
+            ("test".to_string(), Some(0), None),
+            ("test".to_string(), Some(200), Some("Success".to_string())),
+        ];
+
+        assert_eq!(*mock_register.register.lock().unwrap(), expected_register);
+        submitter_service.signal_shutdown().unwrap();
+        submitter_service.shutdown().unwrap();
     }
 }

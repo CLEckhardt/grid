@@ -12,17 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    batch_submission::{
-        submission::{submitter_observer::SubmitterObserver, url_resolver::UrlResolver},
-        Submission,
-    },
-    error::InternalError,
-    scope_id::ScopeId,
-};
+use crate::{error::InternalError, scope_id::ScopeId};
 
 mod async_batch_submitter;
-use async_batch_submitter::*;
+pub use async_batch_submitter::{
+    BatchRunnableSubmitter, BatchRunningSubmitter, BatchSubmitterBuilder,
+};
 
 /*
 
@@ -33,13 +28,8 @@ Maybe the observer can be a reference
 
 */
 
-
 /// The interface for a submitter that is built but not yet running.
-pub trait RunnableSubmitter<
-    S: ScopeId,
-    Q: Iterator<Item = Submission<S>> + Send,
->
-{
+pub trait RunnableSubmitter<S: ScopeId> {
     type RunningSubmitter: RunningSubmitter;
 
     /// Start running the submission service.
