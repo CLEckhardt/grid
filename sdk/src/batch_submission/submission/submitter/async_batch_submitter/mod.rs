@@ -34,8 +34,6 @@ const RETRY_ATTEMPTS: u16 = 10;
 // Time the submitter will wait to repoll after receiving None, in milliseconds
 const POLLING_INTERVAL: u64 = 1000;
 
-// Implementing generics now
-
 pub struct BatchSubmitterBuilder<
     S: 'static + ScopeId,
     Q: 'static + Iterator<Item = Submission<S>> + Send,
@@ -74,7 +72,9 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
         self.mock_execution = true;
     }
 
-    pub fn build(self) -> Result<BatchRunnableSubmitter<S, Q>, InternalError> {
+    pub fn build(
+        self,
+    ) -> Result<BatchRunnableSubmitter<S, Q, SubmissionCommandFactory<S>>, InternalError> {
         let queue = match self.queue {
             Some(q) => q,
             None => {
@@ -91,17 +91,6 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
                 ))
             }
         };
-        if self.mock_execution {
-            let command_factory = match self.url_resolver {
-                Some(u) => MockSubmissionCommandFactory::new(u),
-                None => {
-                    return Err(InternalError::with_message(
-                        "Cannot build BatchRunnableSubmitter, missing url resolver.".to_string(),
-                    ))
-                }
-            };
-            BatchRunnableSubmitter::new(queue, observer, Box::new(command_factory))
-        } else {
             let command_factory = match self.url_resolver {
                 Some(u) => SubmissionCommandFactory::new(u),
                 None => {
@@ -110,18 +99,90 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
                     ))
                 }
             };
-            BatchRunnableSubmitter::new(queue, observer, Box::new(command_factory))
+            BatchRunnableSubmitter::new(queue, observer, command_factory)
+    }
+}
+
+pub struct MockBatchSubmitterBuilder<
+    S: 'static + ScopeId,
+    Q: 'static + Iterator<Item = Submission<S>> + Send,
+> {
+    url_resolver: Option<Arc<dyn UrlResolver<Id = S>>>,
+    queue: Option<Q>,
+    observer: Option<&'static Box<dyn SubmitterObserver<Id = S> + Send>>,
+    mock_execution: bool,
+}
+
+impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
+    MockBatchSubmitterBuilder<S, Q>
+{
+    pub fn new() -> Self {
+        Self {
+            url_resolver: None,
+            queue: None,
+            observer: None,
+            mock_execution: false,
         }
+    }
+
+    pub fn with_url_resolver(&mut self, url_resolver: Arc<dyn UrlResolver<Id = S>>) {
+        self.url_resolver = Some(url_resolver);
+    }
+
+    pub fn with_queue(&mut self, queue: Q) {
+        self.queue = Some(queue);
+    }
+
+    pub fn with_observer(&mut self, observer: &'static Box<dyn SubmitterObserver<Id = S> + Send>) {
+        self.observer = Some(observer);
+    }
+
+    pub fn build(
+        self,
+    ) -> Result<
+        BatchRunnableSubmitter<
+            S,
+            Q,
+            MockSubmissionCommandFactory<S>,
+        >,
+        InternalError,
+    > {
+        let queue = match self.queue {
+            Some(q) => q,
+            None => {
+                return Err(InternalError::with_message(
+                    "Cannot build BatchRunnableSubmitter, missing queue.".to_string(),
+                ))
+            }
+        };
+        let observer = match self.observer {
+            Some(o) => o,
+            None => {
+                return Err(InternalError::with_message(
+                    "Cannot build BatchRunnableSubmitter, missing observer.".to_string(),
+                ))
+            }
+        };
+        let command_factory = match self.url_resolver {
+            Some(u) => MockSubmissionCommandFactory::new(u),
+            None => {
+                return Err(InternalError::with_message(
+                    "Cannot build BatchRunnableSubmitter, missing url resolver.".to_string(),
+                ))
+            }
+        };
+        BatchRunnableSubmitter::new(queue, observer, command_factory)
     }
 }
 
 pub struct BatchRunnableSubmitter<
     S: 'static + ScopeId,
     Q: 'static + Iterator<Item = Submission<S>> + Send,
+    F: 'static + ExecuteCommandFactory<S>,
 > {
     queue: Q,
     observer: &'static Box<dyn SubmitterObserver<Id = S> + Send>,
-    command_factory: Box<dyn ExecuteCommandFactory<S>>,
+    command_factory: F,
     leader_channel: (
         std::sync::mpsc::Sender<TerminateMessage>,
         std::sync::mpsc::Receiver<TerminateMessage>,
@@ -141,13 +202,16 @@ pub struct BatchRunnableSubmitter<
     runtime: tokio::runtime::Runtime,
 }
 
-impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
-    BatchRunnableSubmitter<S, Q>
+impl<
+        S: 'static + ScopeId,
+        Q: 'static + Iterator<Item = Submission<S>> + Send,
+        F: 'static + ExecuteCommandFactory<S>,
+    > BatchRunnableSubmitter<S, Q, F>
 {
     fn new(
         queue: Q,
         observer: &'static Box<dyn SubmitterObserver<Id = S> + Send>,
-        command_factory: Box<dyn ExecuteCommandFactory<S>>,
+        command_factory: F,
     ) -> Result<Self, InternalError> {
         Ok(Self {
             queue,
@@ -166,8 +230,11 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
     }
 }
 
-impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
-    RunnableSubmitter<S, Q> for BatchRunnableSubmitter<S, Q>
+impl<
+        S: 'static + ScopeId,
+        Q: 'static + Iterator<Item = Submission<S>> + Send,
+        F: 'static + ExecuteCommandFactory<S>,
+    > RunnableSubmitter<S, Q> for BatchRunnableSubmitter<S, Q, F>
 {
     type RunningSubmitter = BatchRunningSubmitter;
 
@@ -201,7 +268,7 @@ impl<S: 'static + ScopeId, Q: 'static + Iterator<Item = Submission<S>> + Send>
                             CentralMessage::NewTask(t) => {
                                 tokio::spawn(TaskHandler::spawn(
                                     t,
-                                    submitter_command_factory.clone_factory(),
+                                    submitter_command_factory.clone(),
                                 ));
                             }
                             CentralMessage::Terminate => break,
@@ -357,31 +424,34 @@ impl RunningSubmitter for BatchRunningSubmitter {
     }
 }
 
+/*
 // Clone the factory in a trait-object-safe way
 trait CloneFactory<S: ScopeId> {
-    fn clone_factory(&self) -> Box<dyn ExecuteCommandFactory<S>>;
-}
+    fn clone_factory(&self) -> F: ExecuteCommandFactory<Command = ExecuteCommand<S>>;
+}*/
 
 #[async_trait]
-trait ExecuteCommand<S: ScopeId>: std::fmt::Debug + Sync + Send {
+pub trait ExecuteCommand<S: ScopeId>: std::fmt::Debug + Sync + Send {
     async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error>;
 }
 
-trait ExecuteCommandFactory<S: ScopeId>: CloneFactory<S> + Sync + Send {
-    fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>>;
+pub trait ExecuteCommandFactory<S: ScopeId>: Clone + Sync + Send {
+    //CloneFactory<S> + Sync + Send {
+    type Command: ExecuteCommand<S>;
+    fn new_command(&self, submission: Submission<S>) -> Self::Command;
 }
-
+/*
 impl<S: ScopeId, T> CloneFactory<S> for T
 where
     T: ExecuteCommandFactory<S> + Clone + 'static,
 {
-    fn clone_factory(&self) -> Box<dyn ExecuteCommandFactory<S>> {
+    fn clone_factory(&self) -> T {
         Box::new(self.clone())
     }
-}
+}*/
 
 #[derive(Clone, Debug)]
-struct SubmissionCommandFactory<S: ScopeId> {
+pub struct SubmissionCommandFactory<S: ScopeId> {
     url_resolver: Arc<dyn UrlResolver<Id = S>>,
 }
 
@@ -392,17 +462,18 @@ impl<S: ScopeId> SubmissionCommandFactory<S> {
 }
 
 impl<S: ScopeId> ExecuteCommandFactory<S> for SubmissionCommandFactory<S> {
-    fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>> {
-        Box::new(SubmissionCommand {
+    type Command = SubmissionCommand<S>;
+    fn new_command(&self, submission: Submission<S>) -> SubmissionCommand<S> {
+        SubmissionCommand {
             url_resolver: Arc::clone(&self.url_resolver),
             submission,
             attempts: 0,
-        })
+        }
     }
 }
 
 #[derive(Clone, Debug)]
-struct MockSubmissionCommandFactory<S: ScopeId> {
+pub struct MockSubmissionCommandFactory<S: ScopeId> {
     url_resolver: Arc<dyn UrlResolver<Id = S>>,
 }
 
@@ -413,17 +484,18 @@ impl<S: ScopeId> MockSubmissionCommandFactory<S> {
 }
 
 impl<S: ScopeId> ExecuteCommandFactory<S> for MockSubmissionCommandFactory<S> {
-    fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>> {
-        Box::new(MockSubmissionCommand {
+    type Command = MockSubmissionCommand<S>;
+    fn new_command(&self, submission: Submission<S>) -> MockSubmissionCommand<S> {
+        MockSubmissionCommand {
             url_resolver: Arc::clone(&self.url_resolver),
             submission,
             attempts: 0,
-        })
+        }
     }
 }
 
 #[derive(Debug)]
-struct MockSubmissionCommand<S: ScopeId> {
+pub struct MockSubmissionCommand<S: ScopeId> {
     url_resolver: Arc<dyn UrlResolver<Id = S>>,
     submission: Submission<S>,
     attempts: u16,
@@ -462,7 +534,7 @@ impl<S: ScopeId> ExecuteCommand<S> for MockSubmissionCommand<S> {
 //
 #[derive(Debug)]
 // Responsible for executing the submission request
-struct SubmissionCommand<S: ScopeId> {
+pub struct SubmissionCommand<S: ScopeId> {
     url_resolver: Arc<dyn UrlResolver<Id = S>>,
     submission: Submission<S>,
     attempts: u16,
@@ -498,8 +570,8 @@ impl<S: ScopeId> ExecuteCommand<S> for SubmissionCommand<S> {
 struct SubmissionController;
 
 impl SubmissionController {
-    async fn run<S: ScopeId>(
-        mut command: Box<dyn ExecuteCommand<S>>,
+    async fn run<S: ScopeId, X: ExecuteCommand<S>>(
+        mut command: X,
     ) -> Result<SubmissionResponse<S>, ClientError> {
         let mut wait: u64 = 250;
         let mut response: Result<SubmissionResponse<S>, reqwest::Error> = command.execute().await;
@@ -535,9 +607,9 @@ impl SubmissionController {
 struct TaskHandler;
 
 impl TaskHandler {
-    async fn spawn<'a, S: ScopeId>(
+    async fn spawn<'a, S: ScopeId, F: ExecuteCommandFactory<S>>(
         task: NewTask<S>,
-        submission_command_factory: Box<dyn ExecuteCommandFactory<S>>,
+        submission_command_factory: F,
     ) {
         let batch_header = task.submission.batch_header().clone();
         let scope_id = task.submission.scope_id().clone();
@@ -564,7 +636,7 @@ impl TaskHandler {
 
 #[derive(Debug, PartialEq)]
 // Carries the submission response from the http client back through the submitter to the observer
-struct SubmissionResponse<S: ScopeId> {
+pub struct SubmissionResponse<S: ScopeId> {
     batch_header: String,
     scope_id: S,
     status: u16,
@@ -673,13 +745,4 @@ mod tests {
         }
     }
 
-    #[test]
-    // This test does nothing more than ensure that the only type returned by
-    // SubmissionCommandFactory is a SubmissionCommand (since we are using dynamic dispatch)
-    fn test_batch_submitter_submission_command_factory() {
-        let mock_url_resolver = MockUrlResolver::new("test".to_string());
-        let submission_command_factory =
-            SubmissionCommandFactory::new(Arc::new(mock_url_resolver));
-        let _: Box<SubmissionCommand<GlobalScopeId>> = submission_command_factory.new_command(MockSubmission::new());
-    }
 }
