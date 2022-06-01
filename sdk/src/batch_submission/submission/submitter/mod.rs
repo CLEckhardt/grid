@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod submitter;
-pub mod submitter_observer;
-pub mod url_resolver;
+use crate::{error::InternalError, scope_id::ScopeId, threading::lifecycle::ShutdownHandle};
+
+/// The interface for a non-blocking submitter that is built but not yet running.
+pub trait RunnableSubmitter<S: ScopeId> {
+    type RunningSubmitter: ShutdownHandle;
+
+    /// Start running the submission service.
+    fn run(self) -> Result<Self::RunningSubmitter, InternalError>;
+}
