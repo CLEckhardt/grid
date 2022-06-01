@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use async_trait::async_trait;
+
 use std::fmt;
 
 use crate::{batch_submission::Submission, scope_id::ScopeId};
@@ -88,4 +90,30 @@ struct ErrorResponse<S: ScopeId> {
     batch_header: String,
     scope_id: S,
     error: String,
+}
+
+// Subcomponent traits
+
+trait ExecuteCommandFactory<S: ScopeId>: CloneFactory<S> + Sync + Send {
+    fn new_command(&self, submission: Submission<S>) -> Box<dyn ExecuteCommand<S>>;
+}
+
+// Clone the factory in a trait-object-safe way
+trait CloneFactory<S: ScopeId> {
+    fn clone_factory(&self) -> Box<dyn ExecuteCommandFactory<S>>;
+}
+
+// Implement clone_factory for all command factories
+impl<S: ScopeId, T> CloneFactory<S> for T
+where
+    T: ExecuteCommandFactory<S> + Clone + 'static,
+{
+    fn clone_factory(&self) -> Box<dyn ExecuteCommandFactory<S>> {
+        Box::new(self.clone())
+    }
+}
+
+#[async_trait]
+trait ExecuteCommand<S: ScopeId>: fmt::Debug + Sync + Send {
+    async fn execute(&mut self) -> Result<SubmissionResponse<S>, reqwest::Error>;
 }
