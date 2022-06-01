@@ -12,14 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{error::InternalError, scope_id::ScopeId, threading::lifecycle::ShutdownHandle};
-
-pub mod batch_submitter;
-
-/// The interface for a submitter that is built but not yet running.
-pub trait RunnableSubmitter<S: ScopeId> {
-    type RunningSubmitter: ShutdownHandle;
-
-    /// Start running the submission service.
-    fn run(self) -> Result<Self::RunningSubmitter, InternalError>;
-}
+mod async_batch_submitter;
