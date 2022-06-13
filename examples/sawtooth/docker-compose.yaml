@@ -54,7 +54,6 @@ services:
         sabre perm 621dee05 grid_track_and_trace --key /grid-shared/my_key --read --url http://sawtooth-rest-api:8008 --wait 30
         echo '---------========= track and trace contract is loaded =========---------'
       "
-
   schema-contract-builder:
     image: schema-contract-builder
     container_name: schema-contract-builder
@@ -75,7 +74,6 @@ services:
         sabre perm 621dee05 grid_schema --key /grid-shared/my_key --read --url http://sawtooth-rest-api:8008 --wait 30
         echo '---------========= grid schema contract is loaded =========---------'
       "
-
   pike-contract-builder:
     image: pike-contract-builder
     container_name: pike-contract-builder
@@ -95,7 +93,6 @@ services:
         sabre perm 621dee05 grid_pike --key /grid-shared/my_key --read --write --url http://sawtooth-rest-api:8008 --wait 30
         echo '---------========= pike contract is loaded =========---------'
       "
-
   product-contract-builder:
     image: product-contract-builder
     container_name: product-contract-builder
@@ -119,7 +116,6 @@ services:
         sabre perm 621dee02 grid_product --key /grid-shared/my_key --read --write --url http://sawtooth-rest-api:8008 --wait 30
         echo '---------========= grid_product contract is loaded =========---------'
       "
-
   location-contract-builder:
     image: location-contract-builder
     container_name: location-contract-builder
@@ -141,7 +137,6 @@ services:
         sabre perm 621dee04 grid_location --key /grid-shared/my_key --read --write --url http://sawtooth-rest-api:8008 --wait 30
         echo '---------========= grid_location contract is loaded =========---------'
       "
-
   purchase-order-contract-builder:
     image: purchase-order-contract-builder:${ISOLATION_ID}
     container_name: purchase-order-contract-builder
@@ -164,7 +159,7 @@ services:
       "
 
   sawtooth-validator:
-    image: hyperledger/sawtooth-validator:latest
+    image: sawtooth-validator
     volumes:
       - grid-shared:/grid-shared
     container_name: sawtooth-validator
@@ -177,6 +172,22 @@ services:
     # start the validator with an empty genesis batch
     command: |
       bash -c "
+        rm /usr/bin/python3 \
+         && ln -s /usr/bin/python3.7 /usr/bin/python3 \
+         && ln -s /usr/bin/python3.7 /usr/local/bin/python3
+        apt update && apt install -yq python3-pip python3.7-dev pkg-config
+        python3.7 -m pip install pip --upgrade
+        python3.7 -m pip install --ignore-installed \
+          packaging \
+          pyzmq \
+          lmdb \
+          netifaces \
+          setuptools \
+          protobuf \
+          pyformance
+        python3.7 -m pip install sawtooth-sdk
+        apt install libzmq-dev
+        apt update && apt install -yq libpython3.7 
         if [ ! -f /etc/sawtooth/keys/validator.priv ]; then
           sawadm keygen &&
           sawtooth keygen my_key &&
@@ -211,33 +222,6 @@ services:
     command: |
       bash -c "
         sawtooth-rest-api -v --connect tcp://sawtooth-validator:4004 --bind sawtooth-rest-api:8008
-      "
-    stop_signal: SIGKILL
-
-  sawtooth-settings-tp:
-    image: hyperledger/sawtooth-settings-tp:latest
-    container_name: sawtooth-settings-tp
-    expose:
-      - 4004
-    command: settings-tp -v -C tcp://sawtooth-validator:4004
-    stop_signal: SIGKILL
-
-  sabre-tp:
-    image: hyperledger/sawtooth-sabre-tp:0.5
-    container_name: sawtooth-sabre-tp
-    depends_on:
-      - sawtooth-validator
-    entrypoint: sawtooth-sabre -vv --connect tcp://sawtooth-validator:4004
-
-  sawtooth-client:
-    image: hyperledger/sawtooth-shell:latest
-    container_name: sawtooth-shell
-    depends_on:
-      - sawtooth-validator
-    command: |
-      bash -c "
-        sawtooth keygen &&
-        tail -f /dev/null
       "
     stop_signal: SIGKILL
 
@@ -300,7 +284,6 @@ services:
         gridd -vv -b 0.0.0.0:8080 -k root -C tcp://sawtooth-validator:4004 \
             --database-url postgres://grid:grid_example@db-alpha/grid
       "
-
   # ---== beta node ==---
 
   db-beta:
@@ -351,3 +334,33 @@ services:
             -k root \
             --database-url postgres://grid:grid_example@db-beta/grid
       "
+
+  sawtooth-settings-tp:
+    image: hyperledger/sawtooth-settings-tp:latest
+    container_name: sawtooth-settings-tp
+    depends_on:
+      - sawtooth-validator
+    expose:
+      - 4004
+    command: settings-tp -v -C tcp://sawtooth-validator:4004
+    stop_signal: SIGKILL
+
+  sabre-tp:
+    image: hyperledger/sawtooth-sabre-tp:0.5
+    container_name: sawtooth-sabre-tp
+    depends_on:
+      - sawtooth-validator
+    entrypoint: sawtooth-sabre -vv --connect tcp://sawtooth-validator:4004
+
+  sawtooth-client:
+    image: hyperledger/sawtooth-shell:latest
+    container_name: sawtooth-shell
+    depends_on:
+      - sawtooth-validator
+    command: |
+      bash -c "
+        sawtooth keygen &&
+        tail -f /dev/null
+      "
+    stop_signal: SIGKILL
+
