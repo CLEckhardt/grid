@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt, sync::Arc};
+use std::{
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -20,7 +23,8 @@ use reqwest::Client;
 use crate::{
     batch_submission::{
         submission::{
-            submitter::RunnableSubmitter, submitter_observer::SubmitterObserver,
+            submitter::{RunnableSubmitter, RunningSubmitter},
+            submitter_observer::SubmitterObserver,
             url_resolver::UrlResolver,
         },
         Submission,
@@ -71,13 +75,34 @@ enum BatchMessage<S: ScopeId> {
 // A message sent from the leader thread to the async runtime
 enum CentralMessage<S: ScopeId> {
     NewTask(NewTask<S>),
+    Stop,
     Terminate,
 }
 
-#[derive(Debug)]
 // A message used to instruct the leader and listener threads to terminate
-enum TerminateMessage {
+enum ControlMessage {
+    // Signal to stop the submission service and return to a runnable submitter
+    Stop,
+    // Signal to shutdown the submitter
     Terminate,
+}
+
+// Struct used to collect the queue, url resolver, and observer when the submission service is
+// stopped; to be used in Arc<Mutex<Collector>>
+struct Collector<S: ScopeId> {
+    queue: Option<Box<(dyn Iterator<Item = Submission<S>> + Send)>>,
+    observer: Option<Box<dyn SubmitterObserver<Id = S> + Send>>,
+    command_factory: Option<Box<dyn ExecuteCommandFactory<S>>>,
+}
+
+impl<S: ScopeId> Collector<S> {
+    fn new() -> Self {
+        Self {
+            queue: None,
+            observer: None,
+            command_factory: None,
+        }
+    }
 }
 
 // The object required for an async task to function
@@ -352,12 +377,12 @@ pub struct BatchRunnableSubmitter<S: 'static + ScopeId> {
     observer: Box<dyn SubmitterObserver<Id = S> + Send>,
     command_factory: Box<dyn ExecuteCommandFactory<S>>,
     leader_channel: (
-        std::sync::mpsc::Sender<TerminateMessage>,
-        std::sync::mpsc::Receiver<TerminateMessage>,
+        std::sync::mpsc::Sender<ControlMessage>,
+        std::sync::mpsc::Receiver<ControlMessage>,
     ),
     listener_channel: (
-        std::sync::mpsc::Sender<TerminateMessage>,
-        std::sync::mpsc::Receiver<TerminateMessage>,
+        std::sync::mpsc::Sender<ControlMessage>,
+        std::sync::mpsc::Receiver<ControlMessage>,
     ),
     submission_channel: (
         std::sync::mpsc::Sender<BatchMessage<S>>,
@@ -394,10 +419,10 @@ impl<S: 'static + ScopeId> BatchRunnableSubmitter<S> {
 }
 
 impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
-    type RunningSubmitter = BatchRunningSubmitter;
+    type RunningSubmitter = BatchRunningSubmitter<S>;
 
     /// Start running the submission service.
-    fn run(self) -> Result<BatchRunningSubmitter, InternalError> {
+    fn run(self) -> Result<BatchRunningSubmitter<S>, InternalError> {
         // Move subcomponents out of self
         let mut queue = self.queue;
         let observer = self.observer;
@@ -416,14 +441,31 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
         // Channel for messges from the leader thread to the task-spawning thread
         let (tx_spawner, mut rx_spawner) = self.spawner_channel;
 
+        // Create a collector to collect the queue, observer, and submission command factory on
+        // stop()
+        let collector = Arc::new(Mutex::new(Collector::new()));
+        let queue_collector = Arc::clone(&collector);
+        let observer_collector = Arc::clone(&collector);
+        let submission_command_factory_collector = Arc::clone(&collector);
+
         // Set up and run the listener thread
         let listener_handle = std::thread::Builder::new()
             .name("submitter_listener".to_string())
             .spawn(move || {
                 loop {
-                    // Check for shutdown command
+                    // Check for stop or terminate command
                     match listener_rx.try_recv() {
-                        Ok(_) => break,
+                        Ok(ControlMessage::Stop) => match observer_collector.lock() {
+                            Ok(mut c) => {
+                                c.observer = Some(observer);
+                                break;
+                            }
+                            Err(e) => {
+                                error!("Error collecting observer during stop: {:?}", e);
+                                break;
+                            }
+                        },
+                        Ok(ControlMessage::Terminate) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                         Err(std::sync::mpsc::TryRecvError::Empty) => (),
                     }
@@ -481,12 +523,28 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
                                     submitter_command_factory.clone_factory(),
                                 ));
                             }
+                            CentralMessage::Stop => {
+                                match submission_command_factory_collector.lock() {
+                                    Ok(mut c) => {
+                                        c.command_factory = Some(submitter_command_factory);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        error!(
+                                            "Error collecting submitter_command_factory during \
+                                            stop: {:?}",
+                                            e
+                                        );
+                                        break;
+                                    }
+                                }
+                            }
                             CentralMessage::Terminate => break,
                         }
                     }
                 });
                 // Send terminate message to listener thread
-                if let Err(e) = listener_tx.send(TerminateMessage::Terminate) {
+                if let Err(e) = listener_tx.send(ControlMessage::Terminate) {
                     error!(
                         "Error sending terminate messsage to listener thread: {:?}",
                         e
@@ -502,7 +560,23 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
                 loop {
                     // Check for shutdown command
                     match leader_rx.try_recv() {
-                        Ok(_) => {
+                        Ok(ControlMessage::Stop) => {
+                            match queue_collector.lock() {
+                                Ok(mut c) => {
+                                    c.queue = Some(queue);
+                                    // Send stop message to async runtime
+                                    if let Err(e) = tx_spawner.blocking_send(CentralMessage::Stop) {
+                                        error!("Error sending stop messsage to runtime: {:?}", e)
+                                    };
+                                    break;
+                                }
+                                Err(e) => {
+                                    error!("Error collecting queue during stop: {:?}", e);
+                                    break;
+                                }
+                            }
+                        }
+                        Ok(ControlMessage::Terminate) => {
                             // Send terminate message to async runtime
                             if let Err(e) = tx_spawner.blocking_send(CentralMessage::Terminate) {
                                 error!("Error sending terminate messsage to runtime: {:?}", e)
@@ -547,31 +621,69 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
             leader_handle,
             runtime_handle,
             listener_handle,
+            collector,
         })
     }
 }
 
 /// A running batch submitter service
-pub struct BatchRunningSubmitter {
-    leader_tx: std::sync::mpsc::Sender<TerminateMessage>,
+pub struct BatchRunningSubmitter<S: ScopeId> {
+    leader_tx: std::sync::mpsc::Sender<ControlMessage>,
     leader_handle: std::thread::JoinHandle<()>,
     runtime_handle: std::thread::JoinHandle<()>,
     listener_handle: std::thread::JoinHandle<()>,
+    collector: Arc<Mutex<Collector<S>>>,
 }
 
-impl ShutdownHandle for BatchRunningSubmitter {
+impl<S: ScopeId> RunningSubmitter<S> for BatchRunningSubmitter<S> {
+    type RunnableSubmitter = BatchRunnableSubmitter<S>;
+
+    fn stop(self) -> Result<BatchRunnableSubmitter<S>, InternalError> {
+        self.leader_tx.send(ControlMessage::Stop).map_err(|e| {
+            InternalError::with_message(format!(
+                "Error sending stop message to leader thread: {:?}",
+                e
+            ))
+        })?;
+        let mut collector = self.collector.lock().map_err(|e| {
+            InternalError::with_message(format!(
+                "Error sending stop message to leader thread: {:?}",
+                e
+            ))
+        })?;
+
+        let queue = collector
+            .queue
+            .take()
+            .ok_or(InternalError::with_message(format!(
+                "Error rebuilding BatchRunnableSubmitter: missing queue."
+            )))?;
+        let observer = collector
+            .observer
+            .take()
+            .ok_or(InternalError::with_message(format!(
+                "Error rebuilding BatchRunnableSubmitter: missing observer."
+            )))?;
+        let command_factory =
+            collector
+                .command_factory
+                .take()
+                .ok_or(InternalError::with_message(format!(
+                    "Error rebuilding BatchRunnableSubmitter: missing command_factory."
+                )))?;
+        BatchRunnableSubmitter::new(queue, observer, command_factory)
+    }
+}
+
+impl<S: ScopeId> ShutdownHandle for BatchRunningSubmitter<S> {
     /// Signal the internal processes to begin winding down
     fn signal_shutdown(&mut self) {
-        if let Err(e) = self
-            .leader_tx
-            .send(TerminateMessage::Terminate)
-            .map_err(|e| {
-                InternalError::with_message(format!(
-                    "Error sending termination message to leader thread: {:?}",
-                    e
-                ))
-            })
-        {
+        if let Err(e) = self.leader_tx.send(ControlMessage::Terminate).map_err(|e| {
+            InternalError::with_message(format!(
+                "Error sending termination message to leader thread: {:?}",
+                e
+            ))
+        }) {
             error!("{:?}", e);
         }
     }

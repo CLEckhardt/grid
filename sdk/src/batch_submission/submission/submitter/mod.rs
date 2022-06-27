@@ -18,10 +18,18 @@ pub mod batch_submitter;
 
 /// The interface for a submitter that is built but not yet running.
 pub trait RunnableSubmitter<S: ScopeId> {
-    type RunningSubmitter: ShutdownHandle;
+    type RunningSubmitter: RunningSubmitter<S>;
 
     /// Start running the submission service.
     ///
     /// This method consumes the `RunnableSubmitter` and returns a `RunningSubmitter`
     fn run(self) -> Result<Self::RunningSubmitter, InternalError>;
+}
+
+/// The interface for a running submitter.
+pub trait RunningSubmitter<S: ScopeId>: ShutdownHandle {
+    type RunnableSubmitter: RunnableSubmitter<S>;
+
+    /// Stop the running submitter service and return a runnable submitter (pause the service).
+    fn stop(self) -> Result<Self::RunnableSubmitter, InternalError>;
 }
