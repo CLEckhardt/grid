@@ -76,15 +76,12 @@ enum BatchMessage<S: ScopeId> {
 enum CentralMessage<S: ScopeId> {
     NewTask(NewTask<S>),
     Stop,
-    Terminate,
 }
 
 // A message used to instruct the leader and listener threads to terminate
 enum ControlMessage {
-    // Signal to stop the submission service and return to a runnable submitter
+    // Signal to stop the submission service and collect the configured components
     Stop,
-    // Signal to shutdown the submitter
-    Terminate,
 }
 
 // Struct used to collect the queue, url resolver, and observer when the submission service is
@@ -455,17 +452,7 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
                 loop {
                     // Check for stop or terminate command
                     match listener_rx.try_recv() {
-                        Ok(ControlMessage::Stop) => match observer_collector.lock() {
-                            Ok(mut c) => {
-                                c.observer = Some(observer);
-                                break;
-                            }
-                            Err(e) => {
-                                error!("Error collecting observer during stop: {:?}", e);
-                                break;
-                            }
-                        },
-                        Ok(ControlMessage::Terminate) => break,
+                        Ok(ControlMessage::Stop) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                         Err(std::sync::mpsc::TryRecvError::Empty) => (),
                     }
@@ -506,6 +493,16 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
                         }
                     }
                 }
+                // Begin stop sequence
+                // Move the observer to the collector
+                match observer_collector.lock() {
+                    Ok(mut c) => {
+                        c.observer = Some(observer);
+                    }
+                    Err(e) => {
+                        error!("Error collecting observer during stop: {:?}", e);
+                    }
+                }
             })
             .map_err(|e| InternalError::with_message(format!("{:?}", e)))?;
 
@@ -524,10 +521,11 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
                                 ));
                             }
                             CentralMessage::Stop => {
+                                // Begin stop sequence
+                                // Move the command factory to the collector
                                 match submission_command_factory_collector.lock() {
                                     Ok(mut c) => {
                                         c.command_factory = Some(submitter_command_factory);
-                                        break;
                                     }
                                     Err(e) => {
                                         error!(
@@ -535,20 +533,16 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
                                             stop: {:?}",
                                             e
                                         );
-                                        break;
                                     }
                                 }
+                                break;
                             }
-                            CentralMessage::Terminate => break,
                         }
                     }
                 });
-                // Send terminate message to listener thread
-                if let Err(e) = listener_tx.send(ControlMessage::Terminate) {
-                    error!(
-                        "Error sending terminate messsage to listener thread: {:?}",
-                        e
-                    )
+                // Send stop message to listener thread
+                if let Err(e) = listener_tx.send(ControlMessage::Stop) {
+                    error!("Error sending stop messsage to listener thread: {:?}", e)
                 };
             })
             .map_err(|e| InternalError::with_message(format!("{:?}", e)))?;
@@ -560,37 +554,12 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
                 loop {
                     // Check for shutdown command
                     match leader_rx.try_recv() {
-                        Ok(ControlMessage::Stop) => {
-                            match queue_collector.lock() {
-                                Ok(mut c) => {
-                                    c.queue = Some(queue);
-                                    // Send stop message to async runtime
-                                    if let Err(e) = tx_spawner.blocking_send(CentralMessage::Stop) {
-                                        error!("Error sending stop messsage to runtime: {:?}", e)
-                                    };
-                                    break;
-                                }
-                                Err(e) => {
-                                    error!("Error collecting queue during stop: {:?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(ControlMessage::Terminate) => {
-                            // Send terminate message to async runtime
-                            if let Err(e) = tx_spawner.blocking_send(CentralMessage::Terminate) {
-                                error!("Error sending terminate messsage to runtime: {:?}", e)
-                            };
-                            break;
-                        }
-                        // If disconnected from handle, send terminate message to async runtime
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                            if let Err(e) = tx_spawner.blocking_send(CentralMessage::Terminate) {
-                                error!("Error sending terminate messsage to runtime: {:?}", e)
-                            };
-                            break;
-                        }
+                        // Usually, the channel will be empty
                         Err(std::sync::mpsc::TryRecvError::Empty) => (),
+                        Ok(ControlMessage::Stop) => break,
+                        // If disconnected from handle, begin stop sequence
+                        // This will stop the service if the BatchRunningSubmitter is dropped
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
                     }
                     // Poll for next batch and submit it
                     match queue.next() {
@@ -613,6 +582,18 @@ impl<S: 'static + ScopeId> RunnableSubmitter<S> for BatchRunnableSubmitter<S> {
                         }
                     }
                 }
+                // Begin stop sequence
+                // Move the queue to the collector
+                match queue_collector.lock() {
+                    Ok(mut c) => c.queue = Some(queue),
+                    Err(e) => {
+                        error!("Error collecting queue during stop: {:?}", e);
+                    }
+                }
+                // Send stop message to async runtime
+                if let Err(e) = tx_spawner.blocking_send(CentralMessage::Stop) {
+                    error!("Error sending stop messsage to runtime: {:?}", e)
+                };
             })
             .map_err(|e| InternalError::with_message(format!("{:?}", e)))?;
 
@@ -638,6 +619,7 @@ pub struct BatchRunningSubmitter<S: ScopeId> {
 impl<S: ScopeId> RunningSubmitter<S> for BatchRunningSubmitter<S> {
     type RunnableSubmitter = BatchRunnableSubmitter<S>;
 
+    /// Signal the internal processes to stop and return the service back to a ready-to-run state
     fn stop(self) -> Result<BatchRunnableSubmitter<S>, InternalError> {
         self.leader_tx.send(ControlMessage::Stop).map_err(|e| {
             InternalError::with_message(format!(
@@ -667,14 +649,27 @@ impl<S: ScopeId> RunningSubmitter<S> for BatchRunningSubmitter<S> {
                 "Error rebuilding BatchRunnableSubmitter: missing command_factory.".to_string(),
             )
         })?;
+
+        self.leader_handle
+            .join()
+            .map_err(|e| InternalError::with_message(format!("{:?}", e)))?;
+        self.runtime_handle
+            .join()
+            .map_err(|e| InternalError::with_message(format!("{:?}", e)))?;
+        self.listener_handle
+            .join()
+            .map_err(|e| InternalError::with_message(format!("{:?}", e)))?;
+
         BatchRunnableSubmitter::new(queue, observer, command_factory)
     }
 }
 
 impl<S: ScopeId> ShutdownHandle for BatchRunningSubmitter<S> {
     /// Signal the internal processes to begin winding down
+    // This is the same as `stop()` except that we ignore the collector and don't rebuild a
+    // BatchRunnableSubmitter
     fn signal_shutdown(&mut self) {
-        if let Err(e) = self.leader_tx.send(ControlMessage::Terminate).map_err(|e| {
+        if let Err(e) = self.leader_tx.send(ControlMessage::Stop).map_err(|e| {
             InternalError::with_message(format!(
                 "Error sending termination message to leader thread: {:?}",
                 e
