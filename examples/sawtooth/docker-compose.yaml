@@ -170,7 +170,7 @@ services:
     ports:
       - "4004:4004"
     # start the validator with an empty genesis batch
-    command: |
+    entrypoint: |
       bash -c "
         rm /usr/bin/python3 \
          && ln -s /usr/bin/python3.7 /usr/bin/python3 \
@@ -342,15 +342,21 @@ services:
       - sawtooth-validator
     expose:
       - 4004
-    command: settings-tp -v -C tcp://sawtooth-validator:4004
+    command: |
+      bash -c "
+        settings-tp -v -C tcp://sawtooth-validator:4004
+      "
     stop_signal: SIGKILL
 
   sabre-tp:
-    image: hyperledger/sawtooth-sabre-tp:0.5
+    image: hyperledger/sawtooth-sabre-tp:0.8
     container_name: sawtooth-sabre-tp
     depends_on:
       - sawtooth-validator
-    entrypoint: sawtooth-sabre -vv --connect tcp://sawtooth-validator:4004
+    entrypoint: |
+      bash -c "
+        sawtooth-sabre -vv --connect tcp://sawtooth-validator:4004
+      "
 
   sawtooth-client:
     image: hyperledger/sawtooth-shell:latest
